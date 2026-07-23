@@ -17,10 +17,10 @@ jobs:
       - name: Build locfit for WebAssembly
         uses: r-wasm/actions/build-rwasm@v3
         with:
-          packages: "cran::locfit"
+          packages: "locfit"
           repo-path: "wasm-repo"
           strip: "demo, doc, examples, help, html, include, tests, vignette"
-          webr-image: "ghcr.io/r-wasm/webr:v0.6.0"
+          webr-image: "ghcr.io/r-wasm/webr:main"
       - name: Commit the WASM repo
         run: |
           git config user.name "github-actions[bot]"
