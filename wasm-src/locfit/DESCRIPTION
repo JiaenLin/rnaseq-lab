@@ -1,0 +1,12 @@
+Package: locfit
+Version: 1.5-9.12
+Title: Local Regression (WebAssembly namespace stub)
+Description: A minimal stub that provides the 'locfit' namespace so that DESeq2
+    can be loaded and run with parametric dispersion estimation entirely in the
+    browser (webR). It does not implement local regression; local dispersion
+    fitting is unavailable in this build. The upstream 'locfit' package does not
+    cross-compile to WebAssembly, and DESeq2 only imports the single symbol
+    'locfit' for its (non-default) local fit path.
+Authors@R: person("RNA-seq Lab", role = c("aut", "cre"), email = "noreply@rnaseq-lab.invalid")
+License: GPL-2
+Encoding: UTF-8

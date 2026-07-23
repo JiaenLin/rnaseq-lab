@@ -85,7 +85,10 @@ const DESEQ_R = `local({
   counts <- counts[, cd$sample, drop = FALSE]
   cd$condition <- relevel(factor(cd$condition), ref = REF)
   dds <- DESeqDataSetFromMatrix(counts, cd, ~condition)
-  dds <- DESeq(dds, quiet = TRUE)
+  # Default parametric dispersion fit never calls locfit; on the rare fallback
+  # (locfit is a stub in this build) retry with the locfit-free "mean" fit.
+  dds <- tryCatch(DESeq(dds, quiet = TRUE),
+                  error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
   res <- as.data.frame(results(dds))
   nc <- counts(dds, normalized = TRUE)
   write.csv(data.frame(gene_id = rownames(nc), gene_name = rownames(nc),
