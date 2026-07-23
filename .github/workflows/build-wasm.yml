@@ -17,7 +17,7 @@ jobs:
       - name: Build locfit for WebAssembly
         uses: r-wasm/actions/build-rwasm@v3
         with:
-          packages: "locfit"
+          packages: "cran::locfit"
           repo-path: "wasm-repo"
           strip: "demo, doc, examples, help, html, include, tests, vignette"
           webr-image: "ghcr.io/r-wasm/webr:v0.6.0"
