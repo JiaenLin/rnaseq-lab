@@ -1,0 +1,31 @@
+name: Build WASM deps (locfit)
+
+# Builds the CRAN dependency `locfit` (no public WASM binary) into a CRAN-like
+# WebAssembly repo committed at wasm-repo/, which the deploy workflow serves at
+# /<repo>/wasm/ so webR can install DESeq2. Run manually (workflow_dispatch).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build locfit for WebAssembly
+        uses: r-wasm/actions/build-rwasm@v3
+        with:
+          packages: "locfit"
+          repo-path: "wasm-repo"
+          strip: "demo, doc, examples, help, html, include, tests, vignette"
+          webr-image: "ghcr.io/r-wasm/webr:v0.6.0"
+      - name: Commit the WASM repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -rf wasm-repo/.gitignore
+          git add wasm-repo
+          git commit -m "Build locfit WASM binary" || { echo "no changes"; exit 0; }
+          git push
