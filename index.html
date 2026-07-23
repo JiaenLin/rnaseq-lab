@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RNA-seq Lab — analyze in your browser</title>
+    <meta name="description" content="Run DESeq2 / limma-voom on your counts, entirely in your browser. Nothing is uploaded." />
+    <!-- Cross-origin isolation (SharedArrayBuffer) for webR on static hosts -->
+    <script src="coi-serviceworker.min.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
