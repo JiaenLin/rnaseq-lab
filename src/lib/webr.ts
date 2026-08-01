@@ -58,7 +58,9 @@ const LIMMA_R = `local({
   REF <- __REF__
   counts <- as.matrix(read.csv("/work/counts.csv", row.names = 1, check.names = FALSE))
   storage.mode(counts) <- "double"
-  cd <- read.csv("/work/coldata.csv", stringsAsFactors = FALSE)
+  # colClasses="character": a group named "517E2" is otherwise read as
+  # scientific notation (51700) and then matches nothing.
+  cd <- read.csv("/work/coldata.csv", colClasses = "character", check.names = FALSE)
   counts <- counts[, cd$sample, drop = FALSE]
   grp <- relevel(factor(cd$condition), ref = REF)
   design <- model.matrix(~ grp)
@@ -81,7 +83,8 @@ const DESEQ_R = `local({
   REF <- __REF__
   counts <- round(as.matrix(read.csv("/work/counts.csv", row.names = 1, check.names = FALSE)))
   storage.mode(counts) <- "integer"
-  cd <- read.csv("/work/coldata.csv", stringsAsFactors = FALSE); rownames(cd) <- cd$sample
+  cd <- read.csv("/work/coldata.csv", colClasses = "character", check.names = FALSE)
+  rownames(cd) <- cd$sample
   counts <- counts[, cd$sample, drop = FALSE]
   cd$condition <- relevel(factor(cd$condition), ref = REF)
   dds <- DESeqDataSetFromMatrix(counts, cd, ~condition)
@@ -107,7 +110,7 @@ export async function runAnalysis(input: AnalysisInput, onLog: (m: string) => vo
   const enc = new TextEncoder()
   await webR.FS.writeFile('/work/counts.csv', enc.encode(input.countsCsv))
   const coldata = 'sample,condition\n' +
-    input.samples.map(s => `${s.sample},${s.condition}`).join('\n') + '\n'
+    input.samples.map(s => `${JSON.stringify(s.sample)},${JSON.stringify(s.condition)}`).join('\n') + '\n'
   await webR.FS.writeFile('/work/coldata.csv', enc.encode(coldata))
 
   onLog(`Running ${input.method === 'limma' ? 'limma-voom' : 'DESeq2'}…`)
