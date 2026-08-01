@@ -2,12 +2,27 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Differential expression in your browser — nothing is uploaded.**
+**One job: turn a gene counts matrix into the file
+[RNA-seq Studio](https://jiaenlin.github.io/rnaseq-studio/) opens — nothing is uploaded.**
 
-Upload a counts matrix, define two groups, and run **limma-voom** or **DESeq2** entirely
-client-side via [webR](https://docs.r-wasm.org/webr/latest/) (R 4.6.0 compiled to
-WebAssembly). The result is an RNA-seq Studio **bundle** you can download and explore in the
-[RNA-seq Studio](https://jiaenlin.github.io/rnaseq-studio/) viewer.
+Upload a counts matrix, define two groups, and the lab writes a Studio **bundle** (`.zip`) to
+download and drop on the Studio. That is the whole product — you read and plot your results
+there, not here.
+
+Building that bundle means running the differential expression, because the Studio's format
+carries `deg_<contrast>.csv`. So **limma-voom** or **DESeq2** runs entirely client-side via
+[webR](https://docs.r-wasm.org/webr/latest/) (R 4.6.0 compiled to WebAssembly) to produce it.
+The DE run is the mechanism, not a second product.
+
+### The family — one job each
+
+| App | Takes | Produces |
+|---|---|---|
+| **rnaseq-service** | raw FASTQ | an analysis request + nf-core sample sheet |
+| **rnaseq-lab** (here) | a bulk counts matrix | `bundle.zip` for rnaseq-studio |
+| **rnaseq-studio** | `bundle.zip` | the figures you read |
+| **scrnaseq-lab** | an annotated `.h5ad` / `.rds` | `bundle.zip` for scrnaseq-studio |
+| **scrnaseq-studio** | `bundle.zip` | the figures you read |
 
 👉 **[Open the app](https://jiaenlin.github.io/rnaseq-lab/)**
 

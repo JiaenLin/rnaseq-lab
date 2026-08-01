@@ -5,6 +5,43 @@ import { buildBundleFiles, zipBundle } from './lib/bundle'
 import { detectGroups, isUsableDetection } from './lib/groups'
 
 const EXPLORER_URL = 'https://jiaenlin.github.io/rnaseq-studio/'
+
+/**
+ * Where this page sits between the file you have and the app you want.
+ *
+ * The lab has one job — produce the file RNA-seq Studio opens — and the fastest
+ * way to say so is to show the whole chain with one link lit up. Running
+ * limma-voom or DESeq2 is how the bundle gets its DEG tables, not a second
+ * product: this is not the place you read your results.
+ */
+function Flow({ at }: { at: 'convert' | 'done' }) {
+  const steps: [string, string][] = [
+    ['counts matrix', 'genes × samples'],
+    ['RNA-seq Lab', at === 'done' ? 'converted it' : 'converts it — you are here'],
+    ['bundle .zip', at === 'done' ? 'ready to download' : 'the studio’s input format'],
+    ['RNA-seq Studio', at === 'done' ? 'open it there next' : 'where you explore it'],
+  ]
+  const lit = at === 'done' ? 3 : 1
+  return (
+    <ol className="flex flex-wrap items-stretch gap-1.5">
+      {steps.map(([name, what], i) => (
+        <li key={name} className="flex items-stretch gap-1.5">
+          <div className={`rounded-lg px-2.5 py-1.5 text-left ${i === lit
+            ? 'bg-indigo-50 ring-1 ring-indigo-400 dark:bg-indigo-500/15'
+            : 'bg-slate-100 dark:bg-slate-800/60'}`}>
+            <div className={`text-[11.5px] font-semibold leading-tight ${i === lit
+              ? 'text-indigo-700 dark:text-indigo-300'
+              : 'text-slate-700 dark:text-slate-200'}`}>{name}</div>
+            <div className="text-[10.5px] leading-tight text-slate-400">{what}</div>
+          </div>
+          {i < steps.length - 1 && (
+            <span className="self-center text-[11px] text-slate-300">&rarr;</span>
+          )}
+        </li>
+      ))}
+    </ol>
+  )
+}
 type Step = 'upload' | 'design' | 'run' | 'result'
 
 interface Counts { csv: string; samples: string[]; nGenes: number }
@@ -123,7 +160,9 @@ export default function App() {
     }
   }
 
-  const reset = () => { setStep('upload'); setCounts(null); setResult(null); setZipUrl(null); setLog([]); setRunErr(null) }
+  const [saved, setSaved] = useState(false)
+
+  const reset = () => { setStep('upload'); setCounts(null); setResult(null); setZipUrl(null); setLog([]); setRunErr(null); setSaved(false) }
 
   return (
     <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4">
@@ -131,7 +170,7 @@ export default function App() {
         <span className="grid h-9 w-9 place-items-center rounded-lg bg-indigo-500 font-bold text-white">L</span>
         <div>
           <h1 className="text-lg font-semibold leading-none">RNA-seq Lab</h1>
-          <p className="text-xs text-slate-400">Differential expression in your browser · nothing is uploaded</p>
+          <p className="text-xs text-slate-400">Turns a counts matrix into RNA-seq Studio&rsquo;s input file · nothing is uploaded</p>
         </div>
         {step !== 'upload' && <button className="btn ml-auto" onClick={reset}>Start over</button>}
       </header>
@@ -142,6 +181,14 @@ export default function App() {
       <main className="step-enter flex-1 py-4" key={step}>
         {step === 'upload' && (
           <div className="card p-6">
+            <p className="mb-4 text-sm">
+              This page does one thing: it converts a <b>gene counts matrix</b> into the{' '}
+              <code className="rounded bg-slate-100 px-1 py-0.5 text-[12px] dark:bg-slate-800">bundle.zip</code>{' '}
+              that{' '}
+              <a className="underline" href={EXPLORER_URL} target="_blank" rel="noopener noreferrer">
+                RNA-seq Studio</a>{' '}opens. You read and plot your results there, not here.
+            </p>
+            <div className="mb-5"><Flow at="convert" /></div>
             <h2 className="mb-1 text-base font-semibold">1 · Upload a counts matrix</h2>
             <p className="mb-4 text-sm text-slate-500">
               A CSV/TSV with <b>genes as rows, samples as columns</b>; the first column is the gene id/symbol,
@@ -273,18 +320,43 @@ export default function App() {
 
         {step === 'result' && result && !running && (
           <div className="space-y-4">
-            <div className="card p-6 text-center">
-              <div className="text-sm uppercase tracking-wide text-slate-400">Analysis complete</div>
-              <div className="mt-1 text-3xl font-bold text-indigo-600">{result.nDeg.toLocaleString()}</div>
-              <div className="text-sm text-slate-500">DEGs at padj &lt; 0.05 · {result.numerator} vs {result.denominator} · {method === 'limma' ? 'limma-voom' : 'DESeq2'}</div>
-              <div className="mt-5 flex flex-wrap justify-center gap-2">
-                {zipUrl && <a className="btn btn-primary" href={zipUrl} download={`${sanitize(project)}_bundle.zip`}>⭳ Download bundle (.zip)</a>}
-                <a className="btn" href={EXPLORER_URL} target="_blank" rel="noopener noreferrer">Open RNA-seq Studio ↗</a>
+            <div className="card p-6">
+              <div className="text-sm uppercase tracking-wide text-slate-400">Converted &mdash; the lab&rsquo;s job is done</div>
+              <h2 className="mt-1 text-base font-semibold">
+                {sanitize(project)}_bundle.zip is ready for RNA-seq Studio
+              </h2>
+              <p className="mb-4 mt-1 text-sm text-slate-500">
+                {result.nDeg.toLocaleString()} DEGs at padj &lt; 0.05 · {result.numerator} vs{' '}
+                {result.denominator} · {method === 'limma' ? 'limma-voom' : 'DESeq2'} &mdash; a sanity
+                check on the run. The tables, volcano and enrichment are in the studio.
+              </p>
+              <div className="mb-5"><Flow at="done" /></div>
+
+              {/* Two steps, one live at a time: the studio cannot open a file
+                  that has not been saved yet. */}
+              <div className="grid gap-2.5">
+                <Handoff n={1} title="Save the bundle" done={saved}>
+                  {zipUrl && (
+                    <a className={saved ? 'btn' : 'btn btn-primary'} href={zipUrl}
+                      download={`${sanitize(project)}_bundle.zip`} onClick={() => setSaved(true)}>
+                      ⭳ Download {sanitize(project)}_bundle.zip{saved ? ' again' : ''}
+                    </a>
+                  )}
+                </Handoff>
+                <Handoff n={2} title="Open it in RNA-seq Studio">
+                  <a className={saved ? 'btn btn-primary' : 'btn'} href={EXPLORER_URL}
+                    target="_blank" rel="noopener noreferrer">
+                    Open RNA-seq Studio &rarr;
+                  </a>
+                  <p className="mt-2 text-xs text-slate-400">
+                    Drop the downloaded .zip onto its page. Your data never left this device, and
+                    it does not leave it there either.
+                  </p>
+                </Handoff>
               </div>
-              <p className="mt-3 text-xs text-slate-400">Explore it: open RNA-seq Studio and drop the downloaded .zip onto the page.</p>
             </div>
             <div className="flex justify-center">
-              <button className="btn" onClick={reset}>Analyze another dataset</button>
+              <button className="btn" onClick={reset}>Convert another counts matrix</button>
             </div>
           </div>
         )}
@@ -297,10 +369,27 @@ export default function App() {
   )
 }
 
+/** One numbered step of the handoff out of this app. */
+function Handoff({ n, title, done, children }: {
+  n: number; title: string; done?: boolean; children: React.ReactNode
+}) {
+  return (
+    <div className="flex gap-3 rounded-xl bg-slate-50 p-3.5 dark:bg-slate-800/50">
+      <span className={`grid h-[22px] w-[22px] flex-none place-items-center rounded-md text-[11px] font-bold text-white ${done ? 'bg-emerald-500' : 'bg-indigo-500'}`}>
+        {done ? '✓' : n}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="mb-2 text-sm font-semibold">{title}</div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
 function Steps({ step }: { step: Step }) {
   const items: { id: Step; label: string }[] = [
     { id: 'upload', label: 'Upload' }, { id: 'design', label: 'Design' },
-    { id: 'run', label: 'Run' }, { id: 'result', label: 'Results' },
+    { id: 'run', label: 'Run' }, { id: 'result', label: 'Bundle' },
   ]
   const idx = items.findIndex(i => i.id === step)
   return (
