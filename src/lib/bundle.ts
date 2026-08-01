@@ -7,6 +7,21 @@ export interface BundleParams {
   method: Method
 }
 
+/** Normalize the uploaded matrix's header to the bundle's gene_id/gene_name shape. */
+function rawCountsCsv(countsCsv: string): string {
+  const lines = countsCsv.trim().split(/\r?\n/)
+  if (!lines.length) return countsCsv
+  const head = lines[0].split(',')
+  const second = (head[1] ?? '').replace(/^"|"$/g, '')
+  if (/^(gene_name|symbol|name)$/i.test(second)) return countsCsv   // already shaped
+  const rows = lines.slice(1).map(l => {
+    const c = l.split(',')
+    return [c[0], c[0], ...c.slice(1)].join(',')
+  })
+  const header = ['gene_id', 'gene_name', ...head.slice(1)].join(',')
+  return [header, ...rows].join('\n') + '\n'
+}
+
 // Assemble the RNA-seq Studio bundle files from an analysis result.
 export function buildBundleFiles(
   input: AnalysisInput, result: AnalysisResult, params: BundleParams,
@@ -44,6 +59,9 @@ export function buildBundleFiles(
     'meta.json': enc.encode(JSON.stringify(meta, null, 2) + '\n'),
     'samples.csv': enc.encode(samplesCsv),
     'normalized_counts.csv': enc.encode(result.normCsv),
+    // The raw matrix the user uploaded. Lets RNA-seq Studio run DESeq2 on pairs
+    // this analysis did not cover — DESeq2 models raw counts, not normalized ones.
+    'raw_counts.csv': enc.encode(rawCountsCsv(input.countsCsv)),
     [`deg_${contrastId}.csv`]: enc.encode(result.degCsv),
   }
 }
