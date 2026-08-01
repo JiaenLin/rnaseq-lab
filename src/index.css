@@ -2,7 +2,14 @@
 @tailwind components;
 @tailwind utilities;
 
-:root { color-scheme: light dark; }
+:root {
+  color-scheme: light dark;
+
+  /* Motion. Strong curves — the built-in easings are too weak to feel
+     intentional. Never ease-in on UI; all durations stay under 300ms. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+}
 html, body, #root { height: 100%; }
 body {
   margin: 0;
@@ -18,11 +25,41 @@ body {
 @layer components {
   .card { @apply rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900; }
   .btn { @apply inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm
-    font-medium text-slate-700 transition hover:border-indigo-400 hover:text-indigo-600
-    disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200; }
+    font-medium text-slate-700 hover:border-indigo-400 hover:text-indigo-600
+    disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200;
+    transition: transform 160ms var(--ease-out), color 160ms ease, border-color 160ms ease,
+      background-color 160ms ease; }
+  /* Press feedback — instant confirmation the click was heard. Subtle (0.95–0.98). */
+  .btn:active:not(:disabled) { transform: scale(0.97); }
   .btn-primary { @apply border-indigo-500 bg-indigo-500 text-white hover:bg-indigo-600 hover:text-white; }
   .input { @apply rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm outline-none
     focus:border-indigo-400 dark:border-slate-600 dark:bg-slate-800; }
   .pill { @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium; }
-  .step-dot { @apply grid h-6 w-6 place-items-center rounded-full text-xs font-semibold; }
+  .step-dot { @apply grid h-6 w-6 place-items-center rounded-full text-xs font-semibold;
+    transition: background-color 200ms ease, color 200ms ease; }
+
+  /* Wizard steps. Seen four times a session, so a standard entrance is earned:
+     without it the whole panel teleports. Settles to transform:none so the
+     finished panel never becomes a containing block for sticky children. */
+  .step-enter {
+    opacity: 1;
+    transform: none;
+    transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out);
+  }
+}
+
+@starting-style {
+  .step-enter {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* Reduced motion: keep the fades that explain what appeared, drop what moves. */
+@media (prefers-reduced-motion: reduce) {
+  .btn:active:not(:disabled) { transform: none; }
+
+  @starting-style {
+    .step-enter { transform: none; }
+  }
 }

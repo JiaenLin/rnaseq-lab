@@ -93,7 +93,8 @@ export default function App() {
 
       <Steps step={step} />
 
-      <main className="flex-1 py-4">
+      {/* key={step} remounts on each step, which re-fires the @starting-style entrance */}
+      <main className="step-enter flex-1 py-4" key={step}>
         {step === 'upload' && (
           <div className="card p-6">
             <h2 className="mb-1 text-base font-semibold">1 · Upload a counts matrix</h2>
