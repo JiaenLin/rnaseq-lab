@@ -36,3 +36,11 @@ npm run build && npm run preview
 
 Stack: React + TypeScript + Vite + Tailwind; webR from CDN; zip via `fflate`. No backend.
 Deploys to GitHub Pages on push to `main`.
+
+## Related
+
+- **[RNA-seq Studio](https://jiaenlin.github.io/rnaseq-studio/)**
+  ([source](https://github.com/JiaenLin/rnaseq-studio)) — explore the bundle this app produces.
+- **[RNA-seq Service](https://jiaenlin.github.io/rnaseq-service/)**
+  ([source](https://github.com/JiaenLin/rnaseq-service)) — start from raw FASTQ files instead of
+  a count matrix: scan your sequencing folder and generate an analysis request.
