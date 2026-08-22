@@ -75,7 +75,18 @@ export function buildBundleFiles(
     engine: params.method === 'limma' ? 'webr-limma-voom' : 'webr-deseq2',
     control,
     conditions: input.groupLevels,
-    gene_id_type: 'symbol',
+    /**
+     * What `gene_id` actually holds, which is not always a symbol.
+     *
+     * This was the constant 'symbol'. It is wrong exactly when `geneNames` is
+     * present, because that map EXISTS to carry symbols separately — an
+     * nf-core matrix is keyed by Ensembl accession and the accession stays in
+     * gene_id while the symbol goes to gene_name. Nothing in the studio reads
+     * this field today, so nothing broke; meta.json is the documented contract
+     * between the two apps, and a contract that misdescribes its own first
+     * column is worth more than nothing being broken yet.
+     */
+    gene_id_type: params.geneNames?.size ? 'ensembl' : 'symbol',
     counts_unit: params.countsUnitNote ?? (params.method === 'limma'
       ? 'CPM (library-size normalized)'
       : 'DESeq2 normalized (median-of-ratios)'),
