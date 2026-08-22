@@ -1,22 +1,22 @@
 import { useMemo, useRef, useState } from 'react'
 import Papa from 'papaparse'
-import { runAnalysis, type AnalysisResult, type Method } from './lib/webr'
+import {
+  runAnalysis, getWebR, ensureObjectPackages,
+  type AnalysisResult, type Method, type ContrastRequest,
+} from './lib/webr'
 import { buildBundleFiles, zipBundle } from './lib/bundle'
-import { detectGroups, isUsableDetection } from './lib/groups'
+import { parseMatrix } from './lib/matrix'
+import { readRObject, isRObjectFile } from './lib/robj'
+import {
+  detectFactors, pairwiseContrasts, withinFactorContrasts, interactionContrast,
+  type Design, type ContrastSpec,
+} from './lib/design'
 
 const EXPLORER_URL = 'https://jiaenlin.github.io/rnaseq-studio/'
 
-/**
- * Where this page sits between the file you have and the app you want.
- *
- * The lab has one job — produce the file RNA-seq Studio opens — and the fastest
- * way to say so is to show the whole chain with one link lit up. Running
- * limma-voom or DESeq2 is how the bundle gets its DEG tables, not a second
- * product: this is not the place you read your results.
- */
 function Flow({ at }: { at: 'convert' | 'done' }) {
   const steps: [string, string][] = [
-    ['counts matrix', 'genes × samples'],
+    ['counts / DESeq2 object', 'genes × samples'],
     ['RNA-seq Lab', at === 'done' ? 'converted it' : 'converts it — you are here'],
     ['bundle .zip', at === 'done' ? 'ready to download' : 'the studio’s input format'],
     ['RNA-seq Studio', at === 'done' ? 'open it there next' : 'where you explore it'],
@@ -34,44 +34,42 @@ function Flow({ at }: { at: 'convert' | 'done' }) {
               : 'text-slate-700 dark:text-slate-200'}`}>{name}</div>
             <div className="text-[10.5px] leading-tight text-slate-400">{what}</div>
           </div>
-          {i < steps.length - 1 && (
-            <span className="self-center text-[11px] text-slate-300">&rarr;</span>
-          )}
+          {i < steps.length - 1 && <span className="self-center text-[11px] text-slate-300">&rarr;</span>}
         </li>
       ))}
     </ol>
   )
 }
+
 type Step = 'upload' | 'design' | 'run' | 'result'
 
-interface Counts { csv: string; samples: string[]; nGenes: number }
-
-/** Assign only the two chosen groups' samples; everything else is excluded. */
-function assignByGroups(
-  samples: string[],
-  a: { name: string; samples: string[] },
-  b: { name: string; samples: string[] },
-): Record<string, 'A' | 'B' | null> {
-  const inA = new Set(a.samples), inB = new Set(b.samples)
-  const out: Record<string, 'A' | 'B' | null> = {}
-  for (const s of samples) out[s] = inA.has(s) ? 'A' : inB.has(s) ? 'B' : null
-  return out
+interface Counts {
+  countsCsv: string
+  samples: string[]
+  nGenes: number
+  geneNames: Map<string, string> | null
+  /** where it came from, for the note under the sample count */
+  origin: string
+  /** sample table that arrived with an R object, if any */
+  colData: Record<string, Record<string, string>>
+  colDataColumns: string[]
 }
+
+const EXCLUDED = '—'
 
 export default function App() {
   const [step, setStep] = useState<Step>('upload')
   const [counts, setCounts] = useState<Counts | null>(null)
   const [uploadErr, setUploadErr] = useState<string | null>(null)
+  const [uploadBusy, setUploadBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  // design (two groups)
-  const [nameA, setNameA] = useState('control')
-  const [nameB, setNameB] = useState('treatment')
-  // null = excluded from this comparison. A counts matrix often holds many
-  // arms; forcing every column into A or B would silently pool unrelated ones.
-  const [assign, setAssign] = useState<Record<string, 'A' | 'B' | null>>({})
-  const [detected, setDetected] = useState<{ name: string; samples: string[] }[]>([])
-  const [control, setControl] = useState<'A' | 'B'>('A')
+  // design
+  const [design, setDesign] = useState<Design | null>(null)
+  const [factorNames, setFactorNames] = useState<string[]>([])
+  const [refs, setRefs] = useState<string[]>([])
+  const [groupOf, setGroupOf] = useState<Record<string, string>>({})
+  const [chosen, setChosen] = useState<Set<string>>(new Set())
 
   // run params
   const [method, setMethod] = useState<Method>('limma')
@@ -82,72 +80,188 @@ export default function App() {
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [zipUrl, setZipUrl] = useState<string | null>(null)
   const [runErr, setRunErr] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
 
-  const onFile = (f: File | undefined) => {
-    if (!f) return
-    setUploadErr(null)
-    f.text().then(text => {
-      const parsed = Papa.parse<string[]>(text.trim(), { skipEmptyLines: true })
-      const rows = parsed.data as string[][]
-      if (!rows.length || rows[0].length < 3) {
-        setUploadErr('Expected a gene × sample matrix (first column = gene, ≥2 sample columns).'); return
+  const onLog = (m: string) => setLog(prev => [...prev, m])
+
+  /** Seed the design state from a set of sample names (+ any colData columns). */
+  const seedDesign = (
+    samples: string[],
+    colData: Record<string, Record<string, string>>,
+    colDataColumns: string[],
+  ) => {
+    // A sample table that came with the object beats anything guessed from
+    // names: it is what the pipeline actually modelled.
+    const fromColData = colDataColumns.length > 0
+    let d: Design
+    if (fromColData) {
+      const factors = colDataColumns.map((c, i) => {
+        const values = samples.map(s => colData[s]?.[c] ?? '')
+        return { name: c || `factor${i + 1}`, levels: [...new Set(values)], values }
+      }).filter(f => f.levels.length > 1)
+      const groups = samples.map((_, si) => factors.map(f => f.values[si]).join('_'))
+      const groupLevels = [...new Set(groups)]
+      const cells = new Set(groups)
+      const expected = factors.reduce((a, f) => a * f.levels.length, 1)
+      d = {
+        factors, groups, groupLevels,
+        factorial: factors.length > 1 && cells.size === expected,
+        balanced: false,
       }
-      const samples = rows[0].slice(1).map(s => String(s).trim())
-      const csv = Papa.unparse(rows)                         // normalize to clean CSV for R
-      setCounts({ csv, samples, nGenes: rows.length - 1 })
-      // Infer the design from the column names rather than splitting them in
-      // half — an arbitrary split is wrong for anything but a 2-group matrix.
-      const groups = detectGroups(samples)
-      setDetected(groups)
-      if (isUsableDetection(groups, samples)) {
-        setNameA(groups[0].name)
-        setNameB(groups[1].name)
-        setAssign(assignByGroups(samples, groups[0], groups[1]))
+    } else {
+      d = detectFactors(samples)
+    }
+    setDesign(d)
+    setFactorNames(d.factors.map(f => f.name))
+    setRefs(d.factors.map(f => f.levels[0]))
+    const g: Record<string, string> = {}
+    samples.forEach((s, i) => { g[s] = d.groups[i] })
+    setGroupOf(g)
+    setChosen(new Set())          // filled by the effect-free default below
+    return d
+  }
+
+  const onFile = async (f: File | undefined) => {
+    if (!f) return
+    setUploadErr(null); setUploadBusy(true); setLog([])
+    try {
+      if (isRObjectFile(f.name)) {
+        // nf-core's own object: counts, sample table and design in one file.
+        const webR = await getWebR(onLog)
+        await ensureObjectPackages(webR, /\.rdata|\.rda$/i.test(f.name), onLog)
+        const obj = await readRObject(f, webR, onLog)
+        setCounts({
+          countsCsv: obj.countsCsv, samples: obj.samples, nGenes: obj.nGenes,
+          geneNames: null, origin: obj.source,
+          colData: obj.colData, colDataColumns: obj.colDataColumns,
+        })
+        seedDesign(obj.samples, obj.colData, obj.colDataColumns)
       } else {
-        const a: Record<string, 'A' | 'B' | null> = {}
-        samples.forEach((x, i) => { a[x] = i < Math.ceil(samples.length / 2) ? 'A' : 'B' })
-        setAssign(a)
+        const text = await f.text()
+        const parsed = Papa.parse<string[]>(text.trim(), { skipEmptyLines: true })
+        const m = parseMatrix(parsed.data as string[][])
+        setCounts({
+          countsCsv: m.countsCsv, samples: m.samples, nGenes: m.nGenes,
+          geneNames: m.geneNames ? new Map(m.geneIds.map((id, i) => [id, m.geneNames![i]])) : null,
+          origin: m.annotationColumns.length > 1
+            ? `matrix (${m.annotationColumns.join(' + ')} read as annotation)`
+            : 'matrix',
+          colData: {}, colDataColumns: [],
+        })
+        seedDesign(m.samples, {}, [])
       }
       setStep('design')
-    }).catch(e => setUploadErr(String(e?.message || e)))
+    } catch (e: any) {
+      setUploadErr(String(e?.message || e))
+    } finally {
+      setUploadBusy(false)
+    }
   }
 
-  /** Choosing a detected group renames the slot and re-assigns its samples. */
-  const pickDetected = (slot: 'A' | 'B', name: string) => {
-    const g = detected.find(x => x.name === name)
-    if (!g || !counts) return
-    const other = detected.find(x => x.name === (slot === 'A' ? nameB : nameA))
-    if (slot === 'A') setNameA(name); else setNameB(name)
-    const a = slot === 'A' ? g : other
-    const b = slot === 'A' ? other : g
-    if (a && b) setAssign(assignByGroups(counts.samples, a, b))
-    else setAssign(p => {
-      const next = { ...p }
-      for (const smp of counts.samples) if (g.samples.includes(smp)) next[smp] = slot
-      return next
+  /* ---------- derived design ---------- */
+
+  const named: Design | null = useMemo(() => {
+    if (!design) return null
+    return { ...design, factors: design.factors.map((f, i) => ({ ...f, name: factorNames[i] || f.name })) }
+  }, [design, factorNames])
+
+  const activeSamples = useMemo(
+    () => (counts?.samples ?? []).filter(s => groupOf[s] && groupOf[s] !== EXCLUDED),
+    [counts, groupOf])
+
+  const groupLevels = useMemo(() => {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const s of activeSamples) { const g = groupOf[s]; if (!seen.has(g)) { seen.add(g); out.push(g) } }
+    return out
+  }, [activeSamples, groupOf])
+
+  const groupSizes = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const s of activeSamples) m.set(groupOf[s], (m.get(groupOf[s]) ?? 0) + 1)
+    return m
+  }, [activeSamples, groupOf])
+
+  /** Every contrast worth offering, given the factors and their references. */
+  const available: ContrastSpec[] = useMemo(() => {
+    if (!named) return []
+    const within = named.factors.length > 1 ? withinFactorContrasts(named, refs) : []
+    const base = within.length
+      ? within
+      : pairwiseContrasts(groupLevels, refs[0] ?? groupLevels[0])
+    const ix = named.factors.length > 1 ? interactionContrast(named, refs) : null
+    const all = ix ? [...base, ix] : base
+    // Only offer contrasts whose groups actually survive the exclusions, and
+    // that have enough samples on both sides to estimate anything.
+    return all.filter(c => {
+      const gs = c.kind === 'interaction'
+        ? named.groupLevels
+        : [c.numerator, c.denominator]
+      return gs.every(g => (groupSizes.get(g) ?? 0) >= 2)
     })
-  }
+  }, [named, refs, groupLevels, groupSizes])
 
-  const conditionOf = (group: 'A' | 'B') => (group === 'A' ? nameA : nameB)
-  const samplesForRun = useMemo(
-    () => (counts?.samples || [])
-      .filter(s => assign[s] === 'A' || assign[s] === 'B')
-      .map(s => ({ sample: s, condition: conditionOf(assign[s] as 'A' | 'B') })),
-    [counts, assign, nameA, nameB])
-  const nA = Object.values(assign).filter(g => g === 'A').length
-  const nB = Object.values(assign).filter(g => g === 'B').length
-  const nExcluded = (counts?.samples || []).filter(x => assign[x] !== 'A' && assign[x] !== 'B').length
-  const designOk = !!nameA.trim() && !!nameB.trim() && nameA.trim() !== nameB.trim() && nA >= 2 && nB >= 2
+  // Default selection: everything pairwise, plus the interaction if present.
+  const effectiveChosen = useMemo(() => {
+    if (chosen.size) return chosen
+    // Everything by default, interaction included: the whole point of
+    // detecting it is that someone would not have thought to ask for it.
+    return new Set(available.map(c => c.id))
+  }, [chosen, available])
+
+  const selected = available.filter(c => effectiveChosen.has(c.id))
+  const designOk = groupLevels.length >= 2 && selected.length >= 1 &&
+    groupLevels.every(g => (groupSizes.get(g) ?? 0) >= 2)
+
+  const toggle = (id: string) => setChosen(() => {
+    const next = new Set(effectiveChosen)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next.size ? next : new Set([id])
+  })
+
+  /* ---------- run ---------- */
 
   const doRun = async () => {
-    if (!counts) return
-    setRunning(true); setRunErr(null); setLog([]); setResult(null); setZipUrl(null)
-    const onLog = (m: string) => setLog(prev => [...prev, m])
+    if (!counts || !named) return
+    setRunning(true); setRunErr(null); setResult(null); setZipUrl(null)
     try {
-      const controlCond = conditionOf(control)
-      const input = { countsCsv: counts.csv, samples: samplesForRun, control: controlCond, method }
+      const covariates = named.factors.map(f => f.name)
+      const samples = activeSamples.map(s => {
+        const si = counts.samples.indexOf(s)
+        const rec: Record<string, string> = { sample: s, group: groupOf[s] }
+        named.factors.forEach(f => { rec[f.name] = f.values[si] ?? '' })
+        return rec as { sample: string; group: string }
+      })
+      const requests: ContrastRequest[] = selected.map(c => {
+        if (c.kind !== 'interaction') {
+          return { ...c, plus: [c.numerator], minus: [c.denominator] }
+        }
+        // (A1B1 - A0B1) - (A1B0 - A0B0) written over group means.
+        const [fa, fb] = named.factors
+        const aAlt = fa.levels.find(l => l !== refs[0])!
+        const bAlt = fb.levels.find(l => l !== refs[1])!
+        const g = (a: string, b: string) => {
+          const i = fa.values.findIndex((v, k) => v === a && fb.values[k] === b)
+          if (i < 0) throw new Error(
+            `The interaction needs a ${a}/${b} sample and there is none — ` +
+            `that cell of the design is empty.`)
+          return named.groups[i]
+        }
+        return {
+          ...c,
+          plus: [g(aAlt, bAlt), g(refs[0], refs[1])],
+          minus: [g(refs[0], bAlt), g(aAlt, refs[1])],
+        }
+      })
+
+      const input = {
+        countsCsv: counts.countsCsv, samples, groupLevels, contrasts: requests, method,
+      }
       const res = await runAnalysis(input, onLog)
-      const files = buildBundleFiles(input, res, { project, species, method })
+      const files = buildBundleFiles(input, res, {
+        project, species, method, covariates,
+        geneNames: counts.geneNames ?? undefined,
+      })
       const blob = new Blob([zipBundle(files) as BlobPart], { type: 'application/zip' })
       setZipUrl(URL.createObjectURL(blob))
       setResult(res)
@@ -160,9 +274,10 @@ export default function App() {
     }
   }
 
-  const [saved, setSaved] = useState(false)
-
-  const reset = () => { setStep('upload'); setCounts(null); setResult(null); setZipUrl(null); setLog([]); setRunErr(null); setSaved(false) }
+  const reset = () => {
+    setStep('upload'); setCounts(null); setDesign(null); setResult(null)
+    setZipUrl(null); setLog([]); setRunErr(null); setSaved(false); setChosen(new Set())
+  }
 
   return (
     <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4">
@@ -170,118 +285,168 @@ export default function App() {
         <span className="grid h-9 w-9 place-items-center rounded-lg bg-indigo-500 font-bold text-white">L</span>
         <div>
           <h1 className="text-lg font-semibold leading-none">RNA-seq Lab</h1>
-          <p className="text-xs text-slate-400">Turns a counts matrix into RNA-seq Studio&rsquo;s input file · nothing is uploaded</p>
+          <p className="text-xs text-slate-400">Turns a counts matrix or a DESeq2 object into RNA-seq Studio&rsquo;s input file · nothing is uploaded</p>
         </div>
         {step !== 'upload' && <button className="btn ml-auto" onClick={reset}>Start over</button>}
       </header>
 
       <Steps step={step} />
 
-      {/* key={step} remounts on each step, which re-fires the @starting-style entrance */}
       <main className="step-enter flex-1 py-4" key={step}>
         {step === 'upload' && (
           <div className="card p-6">
             <p className="mb-4 text-sm">
-              This page does one thing: it converts a <b>gene counts matrix</b> into the{' '}
+              This page does one thing: it converts your counts into the{' '}
               <code className="rounded bg-slate-100 px-1 py-0.5 text-[12px] dark:bg-slate-800">bundle.zip</code>{' '}
-              that{' '}
-              <a className="underline" href={EXPLORER_URL} target="_blank" rel="noopener noreferrer">
+              that <a className="underline" href={EXPLORER_URL} target="_blank" rel="noopener noreferrer">
                 RNA-seq Studio</a>{' '}opens. You read and plot your results there, not here.
             </p>
             <div className="mb-5"><Flow at="convert" /></div>
-            <h2 className="mb-1 text-base font-semibold">1 · Upload a counts matrix</h2>
-            <p className="mb-4 text-sm text-slate-500">
-              A CSV/TSV with <b>genes as rows, samples as columns</b>; the first column is the gene id/symbol,
-              the first row is sample names. Raw (integer) counts work best.
+            <h2 className="mb-1 text-base font-semibold">1 · Upload counts</h2>
+            <p className="mb-3 text-sm text-slate-500">
+              Either a <b>CSV/TSV matrix</b> (genes as rows, samples as columns) or an{' '}
+              <b>R object from nf-core/rnaseq</b>.
             </p>
-            <button className="btn btn-primary" onClick={() => fileRef.current?.click()}>⭱ Choose counts file</button>
-            <input ref={fileRef} type="file" accept=".csv,.tsv,.txt" className="hidden"
+            <ul className="mb-4 space-y-1 text-[13px] text-slate-500">
+              <li>· <code className="font-mono text-[12px]">salmon.merged.gene_counts.tsv</code> — the
+                nf-core matrix. Its <code className="font-mono text-[12px]">gene_id</code> and{' '}
+                <code className="font-mono text-[12px]">gene_name</code> columns are recognised as
+                annotation, not as two extra samples.</li>
+              <li>· <code className="font-mono text-[12px]">deseq2.dds.RData</code> — nf-core&rsquo;s
+                DESeq2 object. Carries the counts <em>and</em> the sample table, so the design does not
+                have to be guessed from sample names.</li>
+              <li>· <code className="font-mono text-[12px]">*.SummarizedExperiment.rds</code></li>
+            </ul>
+            <button className="btn btn-primary" disabled={uploadBusy} onClick={() => fileRef.current?.click()}>
+              {uploadBusy ? 'Reading…' : '⭱ Choose counts file or R object'}
+            </button>
+            <input ref={fileRef} type="file" accept=".csv,.tsv,.txt,.rds,.RData,.rda" className="hidden"
               onChange={e => onFile(e.target.files?.[0])} />
             {uploadErr && <p className="mt-3 text-sm text-red-500">{uploadErr}</p>}
-            <p className="mt-4 text-xs text-slate-400">Best for small–moderate datasets (runs on your CPU via WebAssembly). Large datasets: use the desktop app.</p>
+            {log.length > 0 && (
+              <pre className="mt-3 max-h-40 overflow-auto rounded-lg bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800/60 dark:text-slate-300">{log.join('\n')}</pre>
+            )}
+            <p className="mt-4 text-xs text-slate-400">
+              Reading an <code className="font-mono">.RData</code> loads R in the browser first (a one-time
+              download, then cached). Best for small–moderate datasets.
+            </p>
           </div>
         )}
 
-        {step === 'design' && counts && (
+        {step === 'design' && counts && named && (
           <div className="space-y-4">
             <div className="card p-6">
-              <h2 className="mb-1 text-base font-semibold">2 · Define two groups</h2>
-              <p className="mb-4 text-sm text-slate-500">{counts.samples.length} samples · {counts.nGenes.toLocaleString()} genes detected. Assign each sample to a group and pick the control.</p>
-              {detected.length > 1 && detected.length < counts.samples.length && (
-                <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-800/50">
-                  <p className="mb-2 text-xs text-slate-500">
-                    <b>{detected.length} groups</b> detected from your sample names. Pick the two to
-                    compare — samples in any other group are left out of this run.
+              <h2 className="mb-1 text-base font-semibold">2 · Design</h2>
+              <p className="mb-4 text-sm text-slate-500">
+                {counts.samples.length} samples · {counts.nGenes.toLocaleString()} genes · read from{' '}
+                {counts.origin}.
+                {counts.colDataColumns.length > 0 && ' The sample table came with the object.'}
+              </p>
+
+              {named.factors.length > 1 ? (
+                <div className="mb-4 rounded-lg border border-indigo-200 bg-indigo-50/60 p-3 dark:border-indigo-500/30 dark:bg-indigo-500/10">
+                  <p className="mb-2 text-xs text-slate-600 dark:text-slate-300">
+                    <b>{named.factors.map(f => f.levels.length).join(' × ')} factorial design</b> detected
+                    {named.factorial ? '' : ' (some combinations are missing)'}. Name each factor and pick
+                    its reference level — every comparison is then read as “other vs reference”.
                   </p>
                   <div className="grid gap-3 sm:grid-cols-2">
-                    <label className="text-sm">Group A
-                      <select
-                        className="input mt-1 w-full py-1"
-                        value={detected.some(g => g.name === nameA) ? nameA : ''}
-                        onChange={e => pickDetected('A', e.target.value)}
-                      >
-                        <option value="">— choose —</option>
-                        {detected.map(g => (
-                          <option key={g.name} value={g.name}>{g.name} (n={g.samples.length})</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="text-sm">Group B
-                      <select
-                        className="input mt-1 w-full py-1"
-                        value={detected.some(g => g.name === nameB) ? nameB : ''}
-                        onChange={e => pickDetected('B', e.target.value)}
-                      >
-                        <option value="">— choose —</option>
-                        {detected.map(g => (
-                          <option key={g.name} value={g.name}>{g.name} (n={g.samples.length})</option>
-                        ))}
-                      </select>
-                    </label>
+                    {named.factors.map((f, i) => (
+                      <div key={i} className="rounded-lg bg-white/70 p-2.5 dark:bg-slate-800/60">
+                        <input
+                          className="input mb-1.5 w-full py-1 text-sm font-medium"
+                          value={factorNames[i] ?? ''}
+                          onChange={e => setFactorNames(p => p.map((v, k) => (k === i ? e.target.value : v)))}
+                        />
+                        <label className="flex items-center gap-2 text-xs text-slate-500">
+                          reference
+                          <select className="input flex-1 py-0.5 text-xs" value={refs[i] ?? ''}
+                            onChange={e => { setRefs(p => p.map((v, k) => (k === i ? e.target.value : v))); setChosen(new Set()) }}>
+                            {f.levels.map(l => <option key={l} value={l}>{l}</option>)}
+                          </select>
+                        </label>
+                        <p className="mt-1 text-[11px] text-slate-400">{f.levels.join(' · ')}</p>
+                      </div>
+                    ))}
                   </div>
                 </div>
+              ) : (
+                <label className="mb-4 flex flex-wrap items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+                  Control / reference group:
+                  <select className="input py-1" value={refs[0] ?? groupLevels[0] ?? ''}
+                    onChange={e => { setRefs([e.target.value]); setChosen(new Set()) }}>
+                    {groupLevels.map(g => <option key={g} value={g}>{g} (n={groupSizes.get(g) ?? 0})</option>)}
+                  </select>
+                  <span className="text-xs text-slate-400">results read as “other vs reference”</span>
+                </label>
               )}
-              <div className="mb-4 grid gap-3 sm:grid-cols-2">
-                <label className="text-sm">Group A name
-                  <input className="input mt-1 w-full" value={nameA} onChange={e => setNameA(e.target.value)} /></label>
-                <label className="text-sm">Group B name
-                  <input className="input mt-1 w-full" value={nameB} onChange={e => setNameB(e.target.value)} /></label>
+
+              <h3 className="mb-1.5 text-sm font-semibold">Comparisons to export</h3>
+              <p className="mb-2 text-xs text-slate-500">
+                Each one becomes a <code className="font-mono">deg_*.csv</code> in the bundle; the studio
+                lets you switch between them.
+              </p>
+              <div className="mb-4 space-y-1.5">
+                {available.length === 0 && (
+                  <p className="text-xs text-amber-600">No comparison has ≥2 samples on both sides yet.</p>
+                )}
+                {available.map(c => (
+                  <label key={c.id}
+                    className={`flex cursor-pointer items-start gap-2.5 rounded-lg border p-2.5 text-sm ${
+                      effectiveChosen.has(c.id)
+                        ? 'border-indigo-300 bg-indigo-50/60 dark:border-indigo-500/40 dark:bg-indigo-500/10'
+                        : 'border-slate-200 dark:border-slate-700'}`}>
+                    <input type="checkbox" className="mt-0.5" checked={effectiveChosen.has(c.id)}
+                      onChange={() => toggle(c.id)} />
+                    <span className="min-w-0 flex-1">
+                      <span className="font-medium">{c.label}</span>
+                      {c.kind === 'interaction' && (
+                        <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:bg-amber-500/20 dark:text-amber-300">
+                          interaction
+                        </span>
+                      )}
+                      <span className="block font-mono text-[11px] text-slate-400">{c.id}</span>
+                    </span>
+                  </label>
+                ))}
               </div>
-              <label className="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
-                Control / reference:
-                <select className="input py-1" value={control} onChange={e => setControl(e.target.value as 'A' | 'B')}>
-                  <option value="A">{nameA || 'Group A'}</option>
-                  <option value="B">{nameB || 'Group B'}</option>
-                </select>
-                <span className="text-xs text-slate-400">results read as “other vs control”</span>
-              </label>
-              <div className="max-h-72 overflow-auto rounded-lg border border-slate-100 dark:border-slate-800">
-                <table className="w-full text-sm">
-                  <tbody>
-                    {counts.samples.map(s => (
-                      <tr key={s} className="border-t border-slate-100 first:border-0 dark:border-slate-800">
-                        <td className="px-3 py-1.5 font-mono">{s}</td>
-                        <td className="px-3 py-1.5 text-right">
-                          <div className="inline-flex overflow-hidden rounded-lg border border-slate-300 dark:border-slate-600">
-                            {([['A', nameA || 'A'], ['B', nameB || 'B'], [null, 'exclude']] as const).map(([g, lbl]) => (
-                              <button key={String(g)} onClick={() => setAssign(p => ({ ...p, [s]: g }))}
-                                className={`px-3 py-1 text-xs ${assign[s] === g
-                                  ? (g === null ? 'bg-slate-400 text-white' : 'bg-indigo-500 text-white')
-                                  : 'bg-white text-slate-600 dark:bg-slate-800 dark:text-slate-300'}`}>
-                                {lbl}
-                              </button>
-                            ))}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <p className="mt-2 text-xs text-slate-400">
-                {nameA || 'A'}: {nA} · {nameB || 'B'}: {nB}
-                {nExcluded > 0 && ` · ${nExcluded} excluded`}
-                {designOk ? '' : ' · each group needs ≥ 2 samples and distinct names'}
+              {available.some(c => c.kind === 'interaction') && (
+                <p className="mb-4 rounded-lg bg-amber-50 p-2.5 text-[12px] text-amber-800 dark:bg-amber-500/10 dark:text-amber-200">
+                  <b>The interaction</b> asks whether one factor&rsquo;s effect <em>depends on</em> the
+                  other. No pairwise comparison answers it, and in a 2×2 study it is often the real
+                  question. A gene significant here has a different response in one arm than the other —
+                  it is not a fold change and should not be read as one.
+                </p>
+              )}
+
+              <details className="mb-3">
+                <summary className="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-300">
+                  Sample assignment ({activeSamples.length} in · {counts.samples.length - activeSamples.length} excluded)
+                </summary>
+                <div className="mt-2 max-h-72 overflow-auto rounded-lg border border-slate-100 dark:border-slate-800">
+                  <table className="w-full text-sm">
+                    <tbody>
+                      {counts.samples.map(s => (
+                        <tr key={s} className="border-t border-slate-100 first:border-0 dark:border-slate-800">
+                          <td className="px-3 py-1.5 font-mono text-[13px]">{s}</td>
+                          <td className="px-3 py-1.5 text-right">
+                            <select className="input py-0.5 text-xs" value={groupOf[s] ?? EXCLUDED}
+                              onChange={e => { setGroupOf(p => ({ ...p, [s]: e.target.value })); setChosen(new Set()) }}>
+                              {[...new Set([...named.groupLevels, EXCLUDED])].map(g => (
+                                <option key={g} value={g}>{g === EXCLUDED ? 'exclude' : g}</option>
+                              ))}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+
+              <p className="text-xs text-slate-400">
+                {groupLevels.map(g => `${g}: ${groupSizes.get(g) ?? 0}`).join(' · ')}
+                {designOk ? '' : ' · every group needs ≥ 2 samples, and at least one comparison'}
               </p>
             </div>
             <div className="flex justify-between">
@@ -295,6 +460,9 @@ export default function App() {
           <div className="space-y-4">
             <div className="card p-6">
               <h2 className="mb-1 text-base font-semibold">3 · Run</h2>
+              <p className="mb-3 text-sm text-slate-500">
+                {selected.length} comparison{selected.length === 1 ? '' : 's'} from one model fit.
+              </p>
               <div className="grid gap-3 sm:grid-cols-3">
                 <label className="text-sm">Method
                   <select className="input mt-1 w-full" value={method} onChange={e => setMethod(e.target.value as Method)}>
@@ -325,15 +493,31 @@ export default function App() {
               <h2 className="mt-1 text-base font-semibold">
                 {sanitize(project)}_bundle.zip is ready for RNA-seq Studio
               </h2>
-              <p className="mb-4 mt-1 text-sm text-slate-500">
-                {result.nDeg.toLocaleString()} DEGs at padj &lt; 0.05 · {result.numerator} vs{' '}
-                {result.denominator} · {method === 'limma' ? 'limma-voom' : 'DESeq2'} &mdash; a sanity
-                check on the run. The tables, volcano and enrichment are in the studio.
+              <div className="mb-4 mt-2 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-700">
+                <table className="w-full text-sm">
+                  <tbody>
+                    {result.contrasts.map(c => (
+                      <tr key={c.id} className="border-t border-slate-100 first:border-0 dark:border-slate-800">
+                        <td className="px-3 py-1.5">
+                          {c.label}
+                          {c.kind === 'interaction' && (
+                            <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700 dark:bg-amber-500/20 dark:text-amber-300">interaction</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono text-[13px] tabular-nums">
+                          {c.nDeg.toLocaleString()} <span className="text-slate-400">DEG</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="mb-4 text-xs text-slate-400">
+                padj &lt; 0.05 · {method === 'limma' ? 'limma-voom' : 'DESeq2'} — a sanity check on the run.
+                The tables, volcano and enrichment are in the studio.
               </p>
               <div className="mb-5"><Flow at="done" /></div>
 
-              {/* Two steps, one live at a time: the studio cannot open a file
-                  that has not been saved yet. */}
               <div className="grid gap-2.5">
                 <Handoff n={1} title="Save the bundle" done={saved}>
                   {zipUrl && (
@@ -356,7 +540,7 @@ export default function App() {
               </div>
             </div>
             <div className="flex justify-center">
-              <button className="btn" onClick={reset}>Convert another counts matrix</button>
+              <button className="btn" onClick={reset}>Convert another dataset</button>
             </div>
           </div>
         )}
@@ -369,7 +553,6 @@ export default function App() {
   )
 }
 
-/** One numbered step of the handoff out of this app. */
 function Handoff({ n, title, done, children }: {
   n: number; title: string; done?: boolean; children: React.ReactNode
 }) {
