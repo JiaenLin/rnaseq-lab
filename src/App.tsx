@@ -69,7 +69,22 @@ export default function App() {
   const [factorNames, setFactorNames] = useState<string[]>([])
   const [refs, setRefs] = useState<string[]>([])
   const [groupOf, setGroupOf] = useState<Record<string, string>>({})
-  const [chosen, setChosen] = useState<Set<string>>(new Set())
+  /**
+   * Which comparisons to export — `null` until somebody says.
+   *
+   * `null` and `new Set()` are DIFFERENT states, and the difference is the
+   * whole reason "Clear" can exist. This used to be one `Set`, with empty
+   * meaning "the reader has not chosen, so offer all of them", which made
+   * "the reader wants none of them" unrepresentable — `toggle` had to refuse
+   * the last deselection (`return next.size ? next : new Set([id])`) or
+   * unticking the final box would silently retick every box on the page.
+   *
+   * So: `null` means undecided and the default below fills in; a Set means
+   * exactly these, empty included. Anything that INVALIDATES the choice — a new
+   * reference level, a regrouped sample, a new file — sets it back to `null`
+   * rather than to empty, because those change which contrasts exist at all.
+   */
+  const [chosen, setChosen] = useState<Set<string> | null>(null)
 
   // run params
   const [method, setMethod] = useState<Method>('limma')
@@ -117,7 +132,7 @@ export default function App() {
     const g: Record<string, string> = {}
     samples.forEach((s, i) => { g[s] = d.groups[i] })
     setGroupOf(g)
-    setChosen(new Set())          // filled by the effect-free default below
+    setChosen(null)               // filled by the effect-free default below
     return d
   }
 
@@ -203,7 +218,7 @@ export default function App() {
 
   // Default selection: everything pairwise, plus the interaction if present.
   const effectiveChosen = useMemo(() => {
-    if (chosen.size) return chosen
+    if (chosen) return chosen
     // Everything by default, interaction included: the whole point of
     // detecting it is that someone would not have thought to ask for it.
     return new Set(available.map(c => c.id))
@@ -216,8 +231,25 @@ export default function App() {
   const toggle = (id: string) => setChosen(() => {
     const next = new Set(effectiveChosen)
     if (next.has(id)) next.delete(id); else next.add(id)
-    return next.size ? next : new Set([id])
+    return next
   })
+
+  /**
+   * All of them, or none.
+   *
+   * Untangling twelve checkboxes one click at a time to export the one
+   * comparison you came for is the reason this is here — on a 2x3 design
+   * `available` is nine contrasts plus an interaction.
+   *
+   * "All" goes back to `null` rather than writing every id out. It means the
+   * same thing today and keeps meaning it when the set of available contrasts
+   * changes underneath: pick a different reference level after selecting all
+   * explicitly, and a written-out list would leave you with a page of unticked
+   * boxes and no idea why.
+   */
+  const nSelected = selected.length
+  const selectAll = () => setChosen(null)
+  const clearAll = () => setChosen(new Set())
 
   /* ---------- run ---------- */
 
@@ -276,7 +308,7 @@ export default function App() {
 
   const reset = () => {
     setStep('upload'); setCounts(null); setDesign(null); setResult(null)
-    setZipUrl(null); setLog([]); setRunErr(null); setSaved(false); setChosen(new Set())
+    setZipUrl(null); setLog([]); setRunErr(null); setSaved(false); setChosen(null)
   }
 
   return (
@@ -361,7 +393,7 @@ export default function App() {
                         <label className="flex items-center gap-2 text-xs text-slate-500">
                           reference
                           <select className="input flex-1 py-0.5 text-xs" value={refs[i] ?? ''}
-                            onChange={e => { setRefs(p => p.map((v, k) => (k === i ? e.target.value : v))); setChosen(new Set()) }}>
+                            onChange={e => { setRefs(p => p.map((v, k) => (k === i ? e.target.value : v))); setChosen(null) }}>
                             {f.levels.map(l => <option key={l} value={l}>{l}</option>)}
                           </select>
                         </label>
@@ -374,14 +406,29 @@ export default function App() {
                 <label className="mb-4 flex flex-wrap items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
                   Control / reference group:
                   <select className="input py-1" value={refs[0] ?? groupLevels[0] ?? ''}
-                    onChange={e => { setRefs([e.target.value]); setChosen(new Set()) }}>
+                    onChange={e => { setRefs([e.target.value]); setChosen(null) }}>
                     {groupLevels.map(g => <option key={g} value={g}>{g} (n={groupSizes.get(g) ?? 0})</option>)}
                   </select>
                   <span className="text-xs text-slate-400">results read as “other vs reference”</span>
                 </label>
               )}
 
-              <h3 className="mb-1.5 text-sm font-semibold">Comparisons to export</h3>
+              <div className="mb-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <h3 className="text-sm font-semibold">Comparisons to export</h3>
+                {/* A 2x3 design offers nine contrasts plus an interaction, and
+                    getting to the one you came for meant nine clicks. */}
+                {available.length > 1 && (
+                  <span className="ml-auto flex items-center gap-2 text-xs">
+                    <span className="tabular-nums text-slate-400">
+                      {nSelected} of {available.length} selected
+                    </span>
+                    <button type="button" className="btn px-2 py-0.5 text-xs"
+                      disabled={nSelected === available.length} onClick={selectAll}>Select all</button>
+                    <button type="button" className="btn px-2 py-0.5 text-xs"
+                      disabled={nSelected === 0} onClick={clearAll}>Clear</button>
+                  </span>
+                )}
+              </div>
               <p className="mb-2 text-xs text-slate-500">
                 Each one becomes a <code className="font-mono">deg_*.csv</code> in the bundle; the studio
                 lets you switch between them.
@@ -389,6 +436,14 @@ export default function App() {
               <div className="mb-4 space-y-1.5">
                 {available.length === 0 && (
                   <p className="text-xs text-amber-600">No comparison has ≥2 samples on both sides yet.</p>
+                )}
+                {/* Reachable for the first time now that Clear exists, and the
+                    reason the Next button is dead — said where the boxes are,
+                    not only in the small print under the sample table. */}
+                {available.length > 0 && nSelected === 0 && (
+                  <p className="text-xs text-amber-600">
+                    Nothing selected, so the bundle would carry no results. Tick one, or Select all.
+                  </p>
                 )}
                 {available.map(c => (
                   <label key={c.id}
@@ -431,7 +486,7 @@ export default function App() {
                           <td className="px-3 py-1.5 font-mono text-[13px]">{s}</td>
                           <td className="px-3 py-1.5 text-right">
                             <select className="input py-0.5 text-xs" value={groupOf[s] ?? EXCLUDED}
-                              onChange={e => { setGroupOf(p => ({ ...p, [s]: e.target.value })); setChosen(new Set()) }}>
+                              onChange={e => { setGroupOf(p => ({ ...p, [s]: e.target.value })); setChosen(null) }}>
                               {[...new Set([...named.groupLevels, EXCLUDED])].map(g => (
                                 <option key={g} value={g}>{g === EXCLUDED ? 'exclude' : g}</option>
                               ))}
@@ -446,7 +501,10 @@ export default function App() {
 
               <p className="text-xs text-slate-400">
                 {groupLevels.map(g => `${g}: ${groupSizes.get(g) ?? 0}`).join(' · ')}
-                {designOk ? '' : ' · every group needs ≥ 2 samples, and at least one comparison'}
+                {designOk ? ''
+                  : available.length > 0 && nSelected === 0
+                    ? ' · tick at least one comparison to export'
+                    : ' · every group needs ≥ 2 samples, and at least one comparison'}
               </p>
             </div>
             <div className="flex justify-between">
