@@ -4,7 +4,7 @@ import {
   runAnalysis, getWebR, ensureObjectPackages,
   type AnalysisResult, type Method, type ContrastRequest,
 } from './lib/webr'
-import { buildBundleFiles, zipBundle } from './lib/bundle'
+import { buildBundleFiles, referenceGroup, zipBundle } from './lib/bundle'
 import { parseMatrix } from './lib/matrix'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
@@ -292,6 +292,9 @@ export default function App() {
       const res = await runAnalysis(input, onLog)
       const files = buildBundleFiles(input, res, {
         project, species, method, covariates,
+        // The reference the reader actually picked. Not derivable from the
+        // contrasts — see referenceGroup.
+        control: referenceGroup({ factors: named.factors, groupLevels }, refs),
         geneNames: counts.geneNames ?? undefined,
       })
       const blob = new Blob([zipBundle(files) as BlobPart], { type: 'application/zip' })

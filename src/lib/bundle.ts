@@ -10,6 +10,17 @@ export interface BundleParams {
   /** gene_id -> symbol, when the source carried both */
   geneNames?: Map<string, string>
   countsUnitNote?: string
+  /**
+   * The group every reference level points at — see `referenceGroup`.
+   *
+   * Passed in rather than guessed from the contrasts, because the contrasts
+   * cannot say it. Each one holds the reference of the factor it varies and
+   * carries the OTHER factors at whatever level that cell happens to be, so
+   * "the denominator of the first pairwise contrast" is the first level of the
+   * second factor — a fact about the order the sample names were written in,
+   * not about anything the reader chose.
+   */
+  control?: string
 }
 
 const csvCell = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
@@ -53,6 +64,37 @@ function reshapeDeg(csv: string, geneNames: Map<string, string>): string {
   return [lines[0], ...rows].join('\n') + '\n'
 }
 
+/**
+ * The group all the chosen references point at.
+ *
+ * On a 2x2 with genotype = Ctrl and temperature = Thermo that is Ctrl_Thermo,
+ * and it is the one thing about the design that no contrast records. Each
+ * within-factor contrast pins the reference of the factor it varies and holds
+ * the others at whatever level its cell is, so `Ctrl_Cold` and `Ctrl_Thermo`
+ * are both denominators of perfectly correct contrasts. Reading `control` off
+ * the first of them made it the first level of the second factor — the order
+ * the sample names happened to be written in — so picking Thermo as the
+ * reference produced a bundle that recorded Ctrl_Cold.
+ *
+ * Joined with '_' because that is what `withinFactorContrasts` joins with, and
+ * its names are the ones matched against the real groups. Checked against
+ * `groupLevels` rather than trusted: a label no sample carries would leave the
+ * studio's comparison bar seeded with nothing, so an existing group is a better
+ * answer than an invented name.
+ */
+export function referenceGroup(
+  design: { factors: readonly { levels: string[] }[]; groupLevels: readonly string[] },
+  refs: readonly string[],
+): string {
+  const groups = design.groupLevels
+  if (design.factors.length > 1) {
+    const combined = refs.slice(0, design.factors.length).join('_')
+    if (groups.includes(combined)) return combined
+  }
+  if (refs[0] && groups.includes(refs[0])) return refs[0]
+  return groups[0] ?? ''
+}
+
 /** Assemble the RNA-seq Studio bundle from an analysis result. */
 export function buildBundleFiles(
   input: AnalysisInput, result: AnalysisResult, params: BundleParams,
@@ -65,7 +107,9 @@ export function buildBundleFiles(
   // pairwise ones beside it is easy to mistake for a plain fold change.
   const ordered = [...result.contrasts].sort(
     (a, b) => (a.kind === b.kind ? 0 : a.kind === 'pairwise' ? -1 : 1))
-  const control = ordered.find(c => c.kind === 'pairwise')?.denominator ?? input.groupLevels[0]
+  const control = params.control
+    || ordered.find(c => c.kind === 'pairwise')?.denominator
+    || input.groupLevels[0]
 
   const meta = {
     schema: 1,
