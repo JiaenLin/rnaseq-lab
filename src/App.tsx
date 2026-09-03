@@ -87,7 +87,10 @@ export default function App() {
   const [chosen, setChosen] = useState<Set<string> | null>(null)
 
   // run params
-  const [method, setMethod] = useState<Method>('limma')
+  // DESeq2 by default. It is what the studio runs for any comparison the
+  // reader asks for later, so defaulting to it means the bundle's own tables
+  // and anything computed on top of them come from the same engine.
+  const [method, setMethod] = useState<Method>('deseq2')
   const [project, setProject] = useState('My RNA-seq analysis')
   const [species, setSpecies] = useState('human')
   const [log, setLog] = useState<string[]>([])
@@ -536,8 +539,8 @@ export default function App() {
               <div className="grid gap-3 sm:grid-cols-3">
                 <label className="text-sm">Method
                   <select className="input mt-1 w-full" value={method} onChange={e => setMethod(e.target.value as Method)}>
-                    <option value="limma">limma-voom (fast)</option>
                     <option value="deseq2">DESeq2 (gold standard)</option>
+                    <option value="limma">limma-voom (fast)</option>
                   </select></label>
                 <label className="text-sm">Project name
                   <input className="input mt-1 w-full" value={project} onChange={e => setProject(e.target.value)} /></label>
