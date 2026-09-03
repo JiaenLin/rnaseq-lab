@@ -125,6 +125,38 @@ const RECODE_R = String.raw`
   counts <- counts[, cd$sample, drop = FALSE]
   con <- read.csv("/work/contrasts.csv", colClasses = "character", check.names = FALSE)
   ids <- function(s) if (nzchar(s)) paste0("g", strsplit(s, ";", fixed = TRUE)[[1]]) else character(0)
+
+  # Fit only the groups the CHOSEN contrasts actually name.
+  #
+  # ~ 0 + grp is a cell-means model, so a contrast between two groups is a
+  # function of those two group means and of the dispersion, and of nothing
+  # else. Fitting the other 50 groups to answer a question about 5 buys
+  # nothing and costs everything: the per-gene IRLS scales about n*p^2, so an
+  # 11-tissue x 5-age matrix (n=275, p=55) is ~1300x a single tissue (n=25,
+  # p=5) FOR EVERY GENE, and that cost is paid before the first contrast is
+  # looked at. Ticking five comparisons instead of ninety-five used to change
+  # only the cheap part.
+  #
+  # This DOES change the dispersion, which DESeq2 and limma both borrow across
+  # the samples in the fit — deliberately. Pooling dispersion across brain and
+  # gonadal fat was never one quantity to begin with, and the subset fit is
+  # exactly what analysing one tissue's file gives. It is logged, not silent.
+  #
+  # Only the FIT narrows. The bundle's normalized_counts.csv must keep every
+  # sample, because samples.csv and raw_counts.csv both carry all of them and
+  # the studio explores them all - so hold the full matrix aside first.
+  counts_all <- counts
+  used <- unique(unlist(lapply(seq_len(nrow(con)), function(i)
+                        c(ids(con$plus[i]), ids(con$minus[i])))))
+  sel <- as.character(grp) %in% used
+  if (!any(sel)) stop("no sample belongs to any chosen contrast")
+  counts <- counts[, sel, drop = FALSE]
+  cd <- cd[sel, , drop = FALSE]
+  # droplevels or model.matrix emits an all-zero column per absent group and
+  # the design goes rank-deficient.
+  grp <- droplevels(factor(as.character(grp)[sel], levels = levels(grp)))
+  fitnote <- sprintf("fitting %d of %d samples in %d of %d groups",
+                     sum(sel), length(sel), nlevels(grp), length(lv))
 `
 
 const LIMMA_R = String.raw`local({
@@ -134,11 +166,13 @@ const LIMMA_R = String.raw`local({
   design <- model.matrix(~ 0 + grp)
   colnames(design) <- levels(grp)
 
-  cpm <- t(t(counts) / colSums(counts)) * 1e6
+  cpm <- t(t(counts_all) / colSums(counts_all)) * 1e6
   write.csv(data.frame(gene_id = rownames(cpm), gene_name = rownames(cpm),
             round(as.data.frame(cpm), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
+  rm(cpm)
 
   keep <- rowSums(counts >= 10) >= max(2, min(table(grp)))
+  fitnote <- c(fitnote, sprintf("fitting %d of %d genes", sum(keep), length(keep)))
   v <- voom(counts[keep, , drop = FALSE], design)
   fit <- lmFit(v, design)
 
@@ -156,6 +190,7 @@ const LIMMA_R = String.raw`local({
               sprintf("/work/deg_%d.csv", i), row.names = FALSE)
     out <- c(out, sprintf("%s=%d", con$id[i], sum(tt$adj.P.Val < 0.05, na.rm = TRUE)))
   }
+  writeLines(fitnote, "/work/fit.txt")
   paste(out, collapse = "|")
 })`
 
@@ -163,6 +198,14 @@ const DESEQ_R = String.raw`local({
   suppressMessages(library(DESeq2))
   __RECODE__
   counts <- round(counts); storage.mode(counts) <- "integer"
+  # Drop genes nothing can be said about, as the limma path already does.
+  # A 34,514-row mouse annotation carried 1,742 rows that are zero in all 275
+  # samples and ~10,800 that never reach 10 counts in a group's worth of them;
+  # every one of those was still fitted, and each contributed a p-value that
+  # only made the multiple-testing correction harsher.
+  keep <- rowSums(counts >= 10) >= max(2, min(table(grp)))
+  fitnote <- c(fitnote, sprintf("fitting %d of %d genes", sum(keep), length(keep)))
+  counts <- counts[keep, , drop = FALSE]
   cd2 <- data.frame(grp = grp); rownames(cd2) <- cd$sample
   # ~ 0 + grp is a cell-means model: one coefficient per group, so every
   # comparison, interaction included, is a linear combination of them.
@@ -170,9 +213,12 @@ const DESEQ_R = String.raw`local({
   dds <- tryCatch(DESeq(dds, quiet = TRUE),
                   error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
 
-  nc <- counts(dds, normalized = TRUE)
+  sf <- tryCatch(estimateSizeFactorsForMatrix(counts_all),
+                 error = function(e) colSums(counts_all) / mean(colSums(counts_all)))
+  nc <- t(t(counts_all) / sf)
   write.csv(data.frame(gene_id = rownames(nc), gene_name = rownames(nc),
             round(as.data.frame(nc), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
+  rm(nc)
 
   rn <- resultsNames(dds)
   out <- character(0)
@@ -188,6 +234,7 @@ const DESEQ_R = String.raw`local({
               sprintf("/work/deg_%d.csv", i), row.names = FALSE)
     out <- c(out, sprintf("%s=%d", con$id[i], sum(res$padj < 0.05, na.rm = TRUE)))
   }
+  writeLines(fitnote, "/work/fit.txt")
   paste(out, collapse = "|")
 })`
 
@@ -227,6 +274,10 @@ export async function runAnalysis(
   }))
 
   const dec = new TextDecoder()
+  try {
+    dec.decode(await webR.FS.readFile('/work/fit.txt')).split('\n')
+      .filter(Boolean).forEach(l => onLog(l))
+  } catch { /* engine wrote no note */ }
   const contrasts: ContrastResult[] = []
   for (let i = 0; i < input.contrasts.length; i++) {
     const c = input.contrasts[i]
