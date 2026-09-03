@@ -126,37 +126,24 @@ const RECODE_R = String.raw`
   con <- read.csv("/work/contrasts.csv", colClasses = "character", check.names = FALSE)
   ids <- function(s) if (nzchar(s)) paste0("g", strsplit(s, ";", fixed = TRUE)[[1]]) else character(0)
 
-  # Fit only the groups the CHOSEN contrasts actually name.
+  # ONE FIT, THEN PER-CONTRAST EXTRACTION. This is the architecture, and it is
+  # not negotiable per contrast.
   #
-  # ~ 0 + grp is a cell-means model, so a contrast between two groups is a
-  # function of those two group means and of the dispersion, and of nothing
-  # else. Fitting the other 50 groups to answer a question about 5 buys
-  # nothing and costs everything: the per-gene IRLS scales about n*p^2, so an
-  # 11-tissue x 5-age matrix (n=275, p=55) is ~1300x a single tissue (n=25,
-  # p=5) FOR EVERY GENE, and that cost is paid before the first contrast is
-  # looked at. Ticking five comparisons instead of ninety-five used to change
-  # only the cheap part.
+  # ~ 0 + grp is a cell-means model: one coefficient per group over EVERY
+  # sample, so every comparison the app can build — pairwise, pooled-side,
+  # interaction — is a linear combination of those group means, extracted from
+  # the single fit. Dispersion is estimated once across all groups, which is
+  # what DESeq2's own FAQ recommends for multi-group data ("the final dispersion
+  # value will incorporate the within-group variability across all groups"), and
+  # it means every contrast in a run is answered by the same model rather than
+  # by a different one each time.
   #
-  # This DOES change the dispersion, which DESeq2 and limma both borrow across
-  # the samples in the fit — deliberately. Pooling dispersion across brain and
-  # gonadal fat was never one quantity to begin with, and the subset fit is
-  # exactly what analysing one tissue's file gives. It is logged, not silent.
-  #
-  # Only the FIT narrows. The bundle's normalized_counts.csv must keep every
-  # sample, because samples.csv and raw_counts.csv both carry all of them and
-  # the studio explores them all - so hold the full matrix aside first.
-  counts_all <- counts
-  used <- unique(unlist(lapply(seq_len(nrow(con)), function(i)
-                        c(ids(con$plus[i]), ids(con$minus[i])))))
-  sel <- as.character(grp) %in% used
-  if (!any(sel)) stop("no sample belongs to any chosen contrast")
-  counts <- counts[, sel, drop = FALSE]
-  cd <- cd[sel, , drop = FALSE]
-  # droplevels or model.matrix emits an all-zero column per absent group and
-  # the design goes rank-deficient.
-  grp <- droplevels(factor(as.character(grp)[sel], levels = levels(grp)))
-  fitnote <- sprintf("fitting %d of %d samples in %d of %d groups",
-                     sum(sel), length(sel), nlevels(grp), length(lv))
+  # Do NOT narrow the fit to the groups a contrast happens to name. Two
+  # contrasts from one run would then come from two different models, with two
+  # dispersion estimates, and the same comparison would change its p-value
+  # depending on what else was ticked beside it. The contrasts are the cheap
+  # part; keep them that way and pay the fit once.
+  fitnote <- sprintf("one fit: %d samples, %d groups", ncol(counts), nlevels(grp))
 `
 
 const LIMMA_R = String.raw`local({
@@ -166,7 +153,7 @@ const LIMMA_R = String.raw`local({
   design <- model.matrix(~ 0 + grp)
   colnames(design) <- levels(grp)
 
-  cpm <- t(t(counts_all) / colSums(counts_all)) * 1e6
+  cpm <- t(t(counts) / colSums(counts)) * 1e6
   write.csv(data.frame(gene_id = rownames(cpm), gene_name = rownames(cpm),
             round(as.data.frame(cpm), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
   rm(cpm)
@@ -213,9 +200,7 @@ const DESEQ_R = String.raw`local({
   dds <- tryCatch(DESeq(dds, quiet = TRUE),
                   error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
 
-  sf <- tryCatch(estimateSizeFactorsForMatrix(counts_all),
-                 error = function(e) colSums(counts_all) / mean(colSums(counts_all)))
-  nc <- t(t(counts_all) / sf)
+  nc <- counts(dds, normalized = TRUE)
   write.csv(data.frame(gene_id = rownames(nc), gene_name = rownames(nc),
             round(as.data.frame(nc), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
   rm(nc)
