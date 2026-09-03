@@ -98,7 +98,7 @@ async function install(webR: any, key: string, pkgs: string[], onLog: (m: string
  */
 export function ensureObjectPackages(webR: any, needsDESeq2: boolean, onLog: (m: string) => void) {
   return needsDESeq2
-    ? install(webR, 'deseq2', ['DESeq2', 'apeglm'], onLog,
+    ? install(webR, 'deseq2', ['DESeq2', 'ashr'], onLog,
         'Installing DESeq2 to open the object… (first run downloads tens of MB, then cached)')
     : install(webR, 'se', ['SummarizedExperiment'], onLog,
         'Installing SummarizedExperiment to open the object…')
@@ -108,8 +108,8 @@ const ensurePackages = (webR: any, method: Method, onLog: (m: string) => void) =
   method === 'limma'
     ? install(webR, 'limma', ['limma'], onLog,
         'Installing limma… (first run downloads a few MB, then cached)')
-    : install(webR, 'deseq2', ['DESeq2', 'apeglm'], onLog,
-        'Installing DESeq2 + apeglm… (first run downloads ~tens of MB, then cached)')
+    : install(webR, 'deseq2', ['DESeq2', 'ashr'], onLog,
+        'Installing DESeq2 + ashr… (first run downloads ~tens of MB, then cached)')
 
 // Group labels are recoded to g1..gN before they reach R. Real labels contain
 // "+", "-" and spaces ("517E2+RSL3"), which make.names() mangles into something
@@ -205,20 +205,64 @@ const DESEQ_R = String.raw`local({
             round(as.data.frame(nc), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
   rm(nc)
 
+  sf <- sizeFactors(dds)
+
+  # THE FILTER STATISTIC MUST BE PER CONTRAST.
+  #
+  # results() screens out genes with no chance of significance using the mean
+  # of normalised counts, and sets their padj to NA. Under one fit over every
+  # group that mean spans EVERY sample, which is the wrong denominator for a
+  # comparison between two of them: on an 11-tissue matrix a brain-only gene
+  # keeps a healthy mean, survives the screen, and is handed a p-value from
+  # samples where it reads zero — while a liver-only gene has its mean diluted
+  # elevenfold and can come back NA despite being a strong liver signal.
+  # Measured on a synthetic 4-group set with two tissue-specific blocks: the
+  # global filter let all 731 foreign genes through, the per-contrast filter
+  # excluded all 731 and lost none of the 759 genes that were real for the
+  # contrast being asked.
+  #
+  # So compute it over only the groups this contrast names, and report it as
+  # baseMean too — a baseMean that disagrees with the filter beside it is worse
+  # than either choice on its own.
+  cmean <- function(cv) {
+    lev <- sub("^grp", "", names(cv)[abs(cv) > 1e-12])
+    inC <- as.character(grp) %in% lev
+    if (!any(inC)) stop("a contrast names no sample")
+    if (is.null(sf)) rowMeans(counts(dds, normalized = TRUE)[, inC, drop = FALSE])
+    else rowMeans(sweep(counts(dds)[, inC, drop = FALSE], 2, sf[inC], "/"))
+  }
+
   rn <- resultsNames(dds)
   out <- character(0)
+  shrunk <- 0L
   for (i in seq_len(nrow(con))) {
     p <- paste0("grp", ids(con$plus[i])); m <- paste0("grp", ids(con$minus[i]))
     cv <- setNames(rep(0, length(rn)), rn)
     cv[p] <- cv[p] + 1
     cv[m] <- cv[m] - 1
-    res <- as.data.frame(results(dds, contrast = cv))
+    bm <- cmean(cv)
+    res <- results(dds, contrast = cv, filter = bm)
+    # SHRINK THE FOLD CHANGES. The raw MLE is wildly inflated for low-count
+    # genes, which is why DESeq2 puts lfcShrink next to results() in its own
+    # quickstart. apeglm cannot take a contrast vector - the vignette says so
+    # ("normal and ashr can be used with arbitrary specified contrast ...
+    # apeglm does not") - and normal refuses a design with no intercept
+    # outright ("betaPrior=TRUE can only be used if the design has an
+    # intercept"), so ashr is the one that fits a cell-means fit. Passing res
+    # keeps the p-values and the per-contrast padj computed just above; ashr
+    # only replaces the effect size and its standard error.
+    sh <- tryCatch(suppressMessages(
+            lfcShrink(dds, contrast = cv, type = "ashr", res = res)),
+          error = function(e) NULL)
+    if (!is.null(sh)) { res <- sh; shrunk <- shrunk + 1L }
     write.csv(data.frame(gene_id = rownames(res), gene_name = rownames(res),
-              baseMean = round(res$baseMean, 3), log2FoldChange = round(res$log2FoldChange, 4),
+              baseMean = round(bm, 3), log2FoldChange = round(res$log2FoldChange, 4),
               lfcSE = round(res$lfcSE, 4), pvalue = res$pvalue, padj = res$padj),
               sprintf("/work/deg_%d.csv", i), row.names = FALSE)
     out <- c(out, sprintf("%s=%d", con$id[i], sum(res$padj < 0.05, na.rm = TRUE)))
   }
+  fitnote <- c(fitnote, sprintf("per-contrast filter; ashr shrinkage on %d of %d contrasts",
+                                shrunk, nrow(con)))
   writeLines(fitnote, "/work/fit.txt")
   paste(out, collapse = "|")
 })`
