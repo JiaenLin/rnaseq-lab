@@ -4,7 +4,7 @@ import {
   runAnalysis, getWebR, ensureObjectPackages,
   type AnalysisResult, type Method, type ContrastRequest,
 } from './lib/webr'
-import { buildBundleFiles, referenceGroup, zipBundle } from './lib/bundle'
+import { buildBundleFiles, referenceGroup, referenceGroupFor, zipBundle } from './lib/bundle'
 import { parseMatrix } from './lib/matrix'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
@@ -197,13 +197,22 @@ export default function App() {
     return m
   }, [activeSamples, groupOf])
 
+  /**
+   * The reference as a GROUP label, not a factor level. Passing `refs[0]`
+   * straight to `pairwiseContrasts` names a denominator no sample carries
+   * whenever a name position is constant — see `referenceGroupFor`.
+   */
+  const refGroup = useMemo(
+    () => (named ? referenceGroupFor(named, refs, groupLevels) : ''),
+    [named, refs, groupLevels])
+
   /** Every contrast worth offering, given the factors and their references. */
   const available: ContrastSpec[] = useMemo(() => {
     if (!named) return []
     const within = named.factors.length > 1 ? withinFactorContrasts(named, refs) : []
     const base = within.length
       ? within
-      : pairwiseContrasts(groupLevels, refs[0] ?? groupLevels[0])
+      : pairwiseContrasts(groupLevels, refGroup || groupLevels[0])
     const ix = named.factors.length > 1 ? interactionContrast(named, refs) : null
     const all = ix ? [...base, ix] : base
     // Only offer contrasts whose groups actually survive the exclusions, and
@@ -214,7 +223,7 @@ export default function App() {
         : [c.numerator, c.denominator]
       return gs.every(g => (groupSizes.get(g) ?? 0) >= 2)
     })
-  }, [named, refs, groupLevels, groupSizes])
+  }, [named, refs, groupLevels, groupSizes, refGroup])
 
   // Default selection: everything pairwise, plus the interaction if present.
   const effectiveChosen = useMemo(() => {

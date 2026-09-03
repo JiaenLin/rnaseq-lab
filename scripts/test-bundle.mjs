@@ -6,7 +6,7 @@
 
 import { detectFactors, withinFactorContrasts, interactionContrast, pairwiseContrasts }
   from '../src/lib/design.ts'
-import { buildBundleFiles, referenceGroup } from '../src/lib/bundle.ts'
+import { buildBundleFiles, referenceGroup, referenceGroupFor } from '../src/lib/bundle.ts'
 
 let failed = 0
 const check = (name, got, want) => {
@@ -134,6 +134,38 @@ console.log('\nTHE REST OF THE CONTRACT')
   check('and the interaction is there', b.meta.contrasts.some(c => c.kind === 'interaction'), true)
   check('conditions are the groups', b.meta.conditions.sort(),
     ['Ctrl_Cold', 'Ctrl_Thermo', 'KO_Cold', 'KO_Thermo'])
+}
+
+{
+  // ONE TISSUE OF A Tissue_age_rep STUDY
+  //
+  // Upload by_tissue/Liver.gene_counts.tsv from an 11-tissue x 5-age design and
+  // the tissue position is constant, so it is not a factor - but the GROUPS are
+  // still "Liver_008w".."Liver_104w". `refs[0]` is then "008w", a level and not
+  // a group. Handing that to pairwiseContrasts named a denominator no sample
+  // carried; every contrast was dropped by the group-size filter and the page
+  // offered zero comparisons with Run disabled and no message. Regression for
+  // the fix that maps the level back onto its group.
+  console.log('\nONE TISSUE OF A FACTORIAL STUDY')
+  const ages = ['008w', '026w', '060w', '078w', '104w']
+  const groups = ages.flatMap(a => Array(5).fill(`Liver_${a}`))
+  const design = {
+    factors: [{ levels: ages, values: ages.flatMap(a => Array(5).fill(a)) }],
+    groups,
+    groupLevels: ages.map(a => `Liver_${a}`),
+  }
+  check('the level maps back onto its group',
+    referenceGroupFor(design, ['008w']), 'Liver_008w')
+  check('and a different reference is honoured, not ignored',
+    referenceGroupFor(design, ['104w']), 'Liver_104w')
+  check('the raw level was the bug — it is not a group',
+    design.groupLevels.includes('008w'), false)
+  check('every contrast now names a real group',
+    pairwiseContrasts(design.groupLevels, referenceGroupFor(design, ['008w']))
+      .every(c => design.groupLevels.includes(c.numerator) &&
+                  design.groupLevels.includes(c.denominator)), true)
+  check('and there are four of them, not zero',
+    pairwiseContrasts(design.groupLevels, referenceGroupFor(design, ['008w'])).length, 4)
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll bundle tests passed\n')

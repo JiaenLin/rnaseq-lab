@@ -95,6 +95,38 @@ export function referenceGroup(
   return groups[0] ?? ''
 }
 
+/**
+ * The denominator pairwise contrasts are built against — a GROUP label.
+ *
+ * `refs` holds factor LEVELS; groups hold whole labels. They are the same
+ * string only when the name has exactly one varying position. Upload one
+ * tissue of a `Tissue_age_rep` study and the tissue position is constant, so
+ * `detectFactors` rightly drops it and leaves one factor (`008w`…`104w`) while
+ * the groups stay `Liver_008w`…`Liver_104w`. Handing `refs[0]` to
+ * `pairwiseContrasts` then names a denominator no sample carries: every
+ * contrast fails the caller's group-size filter, and the page offers ZERO
+ * comparisons with Run disabled and nothing on screen saying why.
+ *
+ * So map the level back to the group that carries it — which also keeps the
+ * reference dropdown meaningful, since picking `104w` must give `Liver_104w`
+ * and not merely the first group in the file.
+ */
+export function referenceGroupFor(
+  design: {
+    factors: readonly { levels: string[]; values: string[] }[]
+    groups: readonly string[]
+    groupLevels: readonly string[]
+  },
+  refs: readonly string[],
+  groupLevels: readonly string[] = design.groupLevels,
+): string {
+  if (design.factors.length === 1) {
+    const i = design.factors[0].values.findIndex(v => v === refs[0])
+    if (i >= 0 && groupLevels.includes(design.groups[i])) return design.groups[i]
+  }
+  return referenceGroup({ factors: design.factors, groupLevels }, refs)
+}
+
 /** Assemble the RNA-seq Studio bundle from an analysis result. */
 export function buildBundleFiles(
   input: AnalysisInput, result: AnalysisResult, params: BundleParams,
