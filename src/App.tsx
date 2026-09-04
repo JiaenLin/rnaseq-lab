@@ -109,6 +109,7 @@ export default function App() {
   // reader asks for later, so defaulting to it means the bundle's own tables
   // and anything computed on top of them come from the same engine.
   const [method, setMethod] = useState<Method>('deseq2')
+  const [shrink, setShrink] = useState<'none' | 'apeglm'>('none')
   const [project, setProject] = useState('My RNA-seq analysis')
   const [species, setSpecies] = useState('human')
   const [log, setLog] = useState<string[]>([])
@@ -369,10 +370,12 @@ export default function App() {
 
       const input = {
         countsCsv: counts.countsCsv, samples, groupLevels, contrasts: requests, method,
+        shrink: method === 'deseq2' ? shrink : 'none',
       }
       const res = await runAnalysis(input, onLog)
       const files = buildBundleFiles(input, res, {
         project, species, method, covariates,
+        shrink: method === 'deseq2' ? shrink : 'none',
         blockFactor: blocking || undefined,
         // The reference the reader actually picked. Not derivable from the
         // contrasts — see referenceGroup.
@@ -681,6 +684,32 @@ export default function App() {
                 <label className="text-sm">Species
                   <input className="input mt-1 w-full" value={species} onChange={e => setSpecies(e.target.value)} /></label>
               </div>
+
+              {/* Shrinkage is apeglm or nothing. There is no third option and
+                  there will not be one: ashr was here and failed in both
+                  directions on real data — see lib/webr.ts. */}
+              {method === 'deseq2' && (
+                <div className="mt-3">
+                  <label className="text-sm">Fold-change shrinkage
+                    <select className="input mt-1 w-full" value={shrink}
+                      onChange={e => setShrink(e.target.value as 'none' | 'apeglm')}>
+                      <option value="none">none — report the maximum likelihood estimate</option>
+                      <option value="apeglm">apeglm — shrink low-information estimates</option>
+                    </select></label>
+                  <p className="mt-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                    {shrink === 'none'
+                      ? <>Fold changes are reported as fitted. A gene with few counts can show a
+                          very large one on very little evidence — check its lfcSE before
+                          believing it.</>
+                      : <>apeglm pulls estimates toward zero in proportion to how little the data
+                          says, so a 20-fold change measured on 30 counts stops outranking a
+                          two-fold change measured on thousands. It needs a coefficient rather
+                          than a contrast, so each comparison costs an extra Wald re-test —
+                          a few seconds per comparison, and the model is not refitted. The
+                          unshrunk estimate is exported beside it either way.</>}
+                  </p>
+                </div>
+              )}
               <button className="btn btn-primary mt-4" disabled={running} onClick={doRun}>
                 {running ? 'Running…' : `Run ${method === 'limma' ? 'limma-voom' : 'DESeq2'}`}
               </button>

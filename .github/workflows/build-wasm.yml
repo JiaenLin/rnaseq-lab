@@ -1,8 +1,16 @@
-name: Build WASM deps (locfit)
+name: Build WASM deps (locfit, apeglm)
 
-# Builds the CRAN dependency `locfit` (no public WASM binary) into a CRAN-like
+# Builds the dependencies with no public WASM binary into a CRAN-like
 # WebAssembly repo committed at wasm-repo/, which the deploy workflow serves at
-# /<repo>/wasm/ so webR can install DESeq2. Run manually (workflow_dispatch).
+# /<repo>/wasm/. Run manually (workflow_dispatch).
+#
+#   locfit  DESeq2 imports it; there is no wasm build anywhere.
+#   apeglm  the ONLY shrinkage estimator this app offers, and likewise absent —
+#           repo.r-wasm.org carries ashr but not apeglm, and bioc.r-universe
+#           publishes no emscripten binary for it. Its compiled dependencies
+#           (RcppEigen, RcppNumerical, bbmle, emdbook) DO exist there, so only
+#           apeglm itself has to be built here. Until this workflow has run,
+#           choosing apeglm in the browser fails at the install step.
 on:
   workflow_dispatch:
 
@@ -17,7 +25,7 @@ jobs:
       - name: Build locfit for WebAssembly
         uses: r-wasm/actions/build-rwasm@v3
         with:
-          packages: "local::./wasm-src/locfit"
+          packages: "local::./wasm-src/locfit, bioc::apeglm"
           repo-path: "wasm-repo"
           strip: "demo, doc, examples, help, html, include, tests, vignette"
           webr-image: "ghcr.io/r-wasm/webr:main"
@@ -27,5 +35,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           rm -rf wasm-repo/.gitignore
           git add wasm-repo
-          git commit -m "Build locfit WASM binary" || { echo "no changes"; exit 0; }
+          git commit -m "Build locfit + apeglm WASM binaries" || { echo "no changes"; exit 0; }
           git push

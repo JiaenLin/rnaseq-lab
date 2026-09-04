@@ -52,7 +52,23 @@ export interface AnalysisInput {
   groupLevels: string[]                               // every group, in display order
   contrasts: ContrastRequest[]
   method: Method
+  /**
+   * Fold-change shrinkage. apeglm, or nothing — never ashr.
+   *
+   * ashr was here and is gone. It failed in both directions on real data:
+   * measured over the 110 tables of an 11-tissue ageing atlas, it shrank
+   * well-measured significant effects to 0.67 of their MLE, and left 287 genes
+   * carrying |log2FC| > 5 — up to 25.4, a 44-million-fold change — because
+   * those are genes with zero counts in one group where the estimate is
+   * unbounded and its normal-mixture prior cannot pull it back. On the same
+   * contrast apeglm gave 0.86 on the well-measured genes and 0.002 on the
+   * unbounded one. None of ashr's settings changed either number.
+   */
+  shrink?: Shrink
 }
+
+/** Shrinkage estimators this app will use. There is deliberately no third. */
+export type Shrink = 'none' | 'apeglm'
 
 export interface ContrastResult {
   id: string
@@ -158,17 +174,23 @@ export function ensureObjectPackages(webR: any, needsDESeq2: boolean, onLog: (m:
  * leave the worker without DESeq2. Each instance has its own virtual
  * filesystem and has to be furnished separately.
  */
-export const installFor = (webR: any, method: Method) =>
-  webR.installPackages(method === 'limma' ? ['limma'] : ['DESeq2', 'ashr'], {
+/** Packages for an engine, plus apeglm only when shrinkage is actually asked for. */
+export const packagesFor = (method: Method, shrink: Shrink): string[] =>
+  method === 'limma' ? ['limma']
+    : shrink === 'apeglm' ? ['DESeq2', 'apeglm'] : ['DESeq2']
+
+export const installFor = (webR: any, method: Method, shrink: Shrink) =>
+  webR.installPackages(packagesFor(method, shrink), {
     repos: [LOCFIT_REPO, 'https://bioc.r-universe.dev', 'https://repo.r-wasm.org'],
   })
 
-const ensurePackages = (webR: any, method: Method, onLog: (m: string) => void) =>
+const ensurePackages = (webR: any, method: Method, shrink: Shrink, onLog: (m: string) => void) =>
   method === 'limma'
     ? install(webR, 'limma', ['limma'], onLog,
         'Installing limma… (first run downloads a few MB, then cached)')
-    : install(webR, 'deseq2', ['DESeq2', 'ashr'], onLog,
-        'Installing DESeq2 + ashr… (first run downloads ~tens of MB, then cached)')
+    : install(webR, `deseq2:${shrink}`, packagesFor(method, shrink), onLog,
+        `Installing ${packagesFor(method, shrink).join(' + ')}… `
+        + '(first run downloads ~tens of MB, then cached)')
 
 // Group labels are recoded to g1..gN before they reach R. Real labels contain
 // "+", "-" and spaces ("517E2+RSL3"), which make.names() mangles into something
@@ -284,9 +306,10 @@ const DESEQ_R = String.raw`local({
   suppressMessages(library(DESeq2))
   __RECODE__
   counts <- round(counts); storage.mode(counts) <- "integer"
+  SHRINK <- "__SHRINK__"
 
   # Where the time goes, reported back so a slow browser run can be diagnosed
-  # instead of guessed at. Native R on 275 samples: fits 38 s, ashr 46 s,
+  # instead of guessed at. Native R on 275 samples: fits 38 s, shrinkage 46 s,
   # results() 17 s, IO 5 s.
   .t0 <- Sys.time(); .acc <- c()
   tick <- function(lbl) {
@@ -429,8 +452,43 @@ const DESEQ_R = String.raw`local({
     }
 
     rn <- resultsNames(dds)
+
+    # SHRINKAGE IS apeglm OR NOTHING.
+    #
+    # apeglm needs a COEFFICIENT and a cell-means design has none — every
+    # comparison is a contrast between two of its coefficients. The way across
+    # is to relevel so the denominator is the reference and re-run ONLY the Wald
+    # test: nbinomWaldTest reuses the dispersions already estimated, so this is
+    # a reparameterisation of the same model, not a second fit.
+    #
+    # One relevel serves every contrast sharing that denominator, so five age
+    # levels need four relevels for all ten pairs rather than ten. Measured on
+    # one tissue: 2.2 s per relevel, 2.8 s per apeglm call.
+    #
+    # p-values, padj and baseMean still come from the cell-means results()
+    # above, with its per-contrast filter. Only the effect size and its standard
+    # error are replaced — exactly the swap lfcShrink is for.
+    shrinkFits <- new.env(parent = emptyenv())
+    apeglmFor <- function(numLvl, denLvl) {
+      if (SHRINK != "apeglm") return(NULL)
+      if (is.null(shrinkFits[[denLvl]])) {
+        d2 <- dds
+        design(d2) <- ~ grp
+        d2$grp <- relevel(d2$grp, ref = denLvl)
+        assign(denLvl, nbinomWaldTest(d2, quiet = TRUE), envir = shrinkFits)
+      }
+      d2 <- shrinkFits[[denLvl]]
+      cf <- paste0("grp_", numLvl, "_vs_", denLvl)
+      if (!(cf %in% resultsNames(d2))) return(NULL)
+      tryCatch(suppressMessages(lfcShrink(d2, coef = cf, type = "apeglm", quiet = TRUE)),
+               error = function(e) NULL)
+    }
+
     for (i in rows) {
       p <- paste0("grp", ids(con$plus[i])); m <- paste0("grp", ids(con$minus[i]))
+      # A contrast is answered by ONE fit, so every group it names must be in
+      # this block. Without this an unknown name indexes cv with NA and the
+      # comparison comes back as noise rather than as an error.
       if (!all(c(p, m) %in% rn))
         stop(sprintf("contrast %s names a group that is not in block %s", con$id[i], b))
       cv <- setNames(rep(0, length(rn)), rn)
@@ -439,27 +497,25 @@ const DESEQ_R = String.raw`local({
       bm <- cmean(cv)
       res <- results(dds, contrast = cv, filter = bm)
       tick("results()")
-      # SHRINK THE FOLD CHANGES. The raw MLE is wildly inflated for low-count
-      # genes, which is why DESeq2 puts lfcShrink next to results() in its own
-      # quickstart. apeglm cannot take a contrast vector - the vignette says so
-      # ("normal and ashr can be used with arbitrary specified contrast ...
-      # apeglm does not") - and normal refuses a design with no intercept
-      # outright ("betaPrior=TRUE can only be used if the design has an
-      # intercept"), so ashr is the one that fits a cell-means fit. Passing res
-      # keeps the p-values and the per-contrast padj computed just above; ashr
-      # only replaces the effect size and its standard error.
-      #
-      # THE MLE IS KEPT BESIDE IT. ashr fits its prior per fit, so a block full
-      # of strong effects is shrunk less than a quiet one — and comparing
-      # shrunk fold changes BETWEEN blocks would then read that difference in
-      # shrinkage as a difference in biology. Display the shrunk value; compare
-      # log2FoldChange_MLE across blocks.
+
+      # THE MLE IS ALWAYS EXPORTED, shrunk or not. Comparing effect sizes
+      # BETWEEN fits — which is the whole of the cross-block view in the studio
+      # — has to be done on estimates that were not each pulled toward their
+      # own fit's prior by a different amount.
       mle <- res$log2FoldChange; mleSE <- res$lfcSE
-      sh <- tryCatch(suppressMessages(
-              lfcShrink(dds, contrast = cv, type = "ashr", res = res)),
-            error = function(e) NULL)
-      if (!is.null(sh)) { res <- sh; shrunk <- shrunk + 1L }
-      tick("lfcShrink (ashr)")
+
+      # Only a one-group-per-side comparison is a coefficient. A pooled side or
+      # an interaction is not, so it keeps the MLE and the note says how many.
+      simple <- length(ids(con$plus[i])) == 1 && length(ids(con$minus[i])) == 1
+      sh <- if (simple) apeglmFor(sub("^grp", "", p), sub("^grp", "", m)) else NULL
+      if (!is.null(sh)) {
+        j <- match(rownames(res), rownames(sh))
+        res$log2FoldChange <- sh$log2FoldChange[j]
+        res$lfcSE <- sh$lfcSE[j]
+        shrunk <- shrunk + 1L
+      }
+      tick("lfcShrink (apeglm)")
+
       # p-values at 4 significant figures. R writes them at full double
       # precision — 0.0435007582036718 is eighteen characters where five would
       # do — and across 110 tables of 17k rows those two columns are a third of
@@ -475,8 +531,9 @@ const DESEQ_R = String.raw`local({
       ncon <- ncon + 1L
     }
   }
-  fitnote <- c(fitnote, sprintf("per-contrast filter; ashr shrinkage on %d of %d contrasts",
-                                shrunk, ncon))
+  fitnote <- c(fitnote, if (SHRINK == "apeglm")
+    sprintf("per-contrast filter; apeglm shrinkage on %d of %d contrasts", shrunk, ncon)
+    else sprintf("per-contrast filter; no shrinkage — fold changes are the MLE (%d contrasts)", ncon))
   tick("write tables")
   fitnote <- c(fitnote, paste0("time: ", paste(sprintf("%s %.1fs", names(.acc), unlist(.acc)),
                                                collapse = " | ")))
@@ -516,6 +573,7 @@ async function runSession(
   const script = (input.method === 'limma' ? LIMMA_R : DESEQ_R)
     .replaceAll('__RECODE__', RECODE_R)
     .replaceAll('__WRITENORM__', writeNorm ? 'TRUE' : 'FALSE')
+    .replaceAll('__SHRINK__', input.shrink ?? 'none')
   const summary: string = await webR.evalRString(script)
 
   const nDeg = new Map(summary.split('|').filter(Boolean).map(kv => {
@@ -557,13 +615,14 @@ export async function runAnalysis(
     `Contrast "${strayed.label}" spans more than one block, so no single fit answers it.`)
 
   const blocks = blocksOf(input.samples)
+  const shrink: Shrink = input.shrink ?? 'none'
   const engine = input.method === 'limma' ? 'limma-voom' : 'DESeq2'
   const workers = webRIn ? 1 : poolSize(blocks.length)
 
   /* ---------- one instance: unblocked runs, and small blocked ones ---------- */
   if (workers <= 1) {
     const webR = webRIn ?? await getWebR(onLog)
-    await ensurePackages(webR, input.method, onLog)
+    await ensurePackages(webR, input.method, shrink, onLog)
     onLog(`Running ${engine} — ${input.contrasts.length} contrast(s)`
       + (blocks.length > 1 ? ` across ${blocks.length} blocks (${blocks.length} fits)…` : '…'))
     const r = await runSession(webR, input, true)
@@ -590,7 +649,7 @@ export async function runAnalysis(
 
   const mod = await getModule()
   const lead = webRIn ?? await getWebR(onLog)
-  await ensurePackages(lead, input.method, onLog)
+  await ensurePackages(lead, input.method, shrink, onLog)
 
   const pool: any[] = [lead]
   if (workers > 1) {
@@ -598,7 +657,7 @@ export async function runAnalysis(
     const extra = await Promise.all(
       Array.from({ length: workers - 1 }, async () => {
         const w = await spawnWebR(mod)
-        await installFor(w, input.method)
+        await installFor(w, input.method, shrink)
         return w
       }))
     pool.push(...extra)
