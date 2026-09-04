@@ -46,7 +46,16 @@ const lift = name => {
   return m[1]
 }
 const RECODE = lift('RECODE_R')
-const engine = name => lift(name).replace('__RECODE__', RECODE).replaceAll('/work/', `${WORK}/`)
+// `writeNorm` decides whether this session owns normalized_counts.csv. A pool
+// worker holds one block's columns and must not write a matrix spanning every
+// sample; the single-instance path does. replaceAll, because the token also
+// appears in a comment and .replace would substitute that one instead — which
+// is exactly the bug this line once shipped.
+const engine = (name, writeNorm = true) =>
+  lift(name)
+    .replaceAll('__RECODE__', RECODE)
+    .replaceAll('__WRITENORM__', writeNorm ? 'TRUE' : 'FALSE')
+    .replaceAll('/work/', `${WORK}/`)
 
 /* ---------- a dataset whose blocks differ in within-group variance ---------- */
 // The scenario blocking exists for: two blocks, the SAME true fold changes in
@@ -96,6 +105,7 @@ for (let g = 0; g < NGENES; g++) {
 const countsCsv = rows.join('\n') + '\n'
 
 /* ---------- write what runAnalysis writes ---------- */
+
 rmSync(WORK, { recursive: true, force: true })
 mkdirSync(WORK, { recursive: true })
 const idxOf = g => groupLevels.indexOf(g) + 1
@@ -216,6 +226,42 @@ let refused = false
 try { runR(DESEQ) } catch (e) { refused = /not in block/.test(String(e.stderr || e)) }
 check('a contrast naming a group outside its block is refused', refused, true)
 
+/* ---------- a pool worker: one block, and it writes no norm matrix ---------- */
+console.log('\nAS A POOL WORKER')
+{
+  // Exactly what lib/parallel.ts hands a worker: one block's columns only.
+  const mine = samples.filter(s => s.block === 'Quiet')
+  const head = countsCsv.split('\n')[0].split(',')
+  const cols = mine.map(s => head.indexOf(`"${s.sample}"`))
+  const sub = countsCsv.trim().split('\n')
+    .map(l => { const c = l.split(','); return [c[0], ...cols.map(i => c[i])].join(',') })
+    .join('\n') + '\n'
+  writeFileSync(join(WORK, 'counts.csv'), sub)
+  writeFileSync(join(WORK, 'coldata.csv'), 'sample,group,block\n' +
+    mine.map(s => `"${s.sample}","${s.group}","Quiet"`).join('\n') + '\n')
+  writeFileSync(join(WORK, 'levels.txt'), groupLevels.join('\n') + '\n')
+  writeFileSync(join(WORK, 'contrasts.csv'), 'id,plus,minus,block\n' +
+    `"Quiet_old_vs_Quiet_young","${idxOf('Quiet_old')}","${idxOf('Quiet_young')}","Quiet"\n`)
+  rmSync(join(WORK, 'norm.csv'), { force: true })
+  rmSync(join(WORK, 'kept.txt'), { force: true })
+  runR(engine('DESEQ_R', false))
+  check('a worker writes no normalized_counts matrix', existsSync(join(WORK, 'norm.csv')), false)
+  check('it reports the genes it fitted instead', existsSync(join(WORK, 'kept.txt')), true)
+  const kept = readFileSync(join(WORK, 'kept.txt'), 'utf8').trim().split('\n')
+  check('and that list is non-empty and unique',
+    kept.length > 100 && new Set(kept).size === kept.length, true)
+
+  // THE POINT: one block on its own must give exactly what it gave inside the
+  // whole run. A worker seeing 10 of 20 columns cannot be allowed to drift.
+  const solo = readFileSync(join(WORK, 'deg_1.csv'), 'utf8')
+  writeInputs(true)
+  runR(engine('DESEQ_R', true))
+  const together = readFileSync(join(WORK, 'deg_1.csv'), 'utf8')
+  check('a block fitted alone is byte-identical to the same block fitted beside others',
+    solo === together, true)
+}
+
 rmSync(WORK, { recursive: true, force: true })
 console.log(failed ? `\n${failed} engine test(s) failed\n` : '\nAll engine tests passed\n')
 process.exit(failed ? 1 : 0)
+
