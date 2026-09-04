@@ -9,7 +9,8 @@ import { parseMatrix } from './lib/matrix'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
   detectFactors, pairwiseContrasts, withinFactorContrasts, interactionContrast,
-  type Design, type ContrastSpec,
+  blockedContrasts, suggestBlockFactor,
+  type Design, type ContrastSpec, type ContrastScheme,
 } from './lib/design'
 
 const EXPLORER_URL = 'https://jiaenlin.github.io/rnaseq-studio/'
@@ -86,6 +87,20 @@ export default function App() {
    */
   const [chosen, setChosen] = useState<Set<string> | null>(null)
 
+  /**
+   * The factor fitted separately, if any. -1 is "one fit over everything" —
+   * the default, and what every design smaller than an atlas wants.
+   *
+   * Held as an INDEX, because that is what survives the reader renaming a
+   * factor. Keeping the name here instead meant typing "tissue" over "factor1"
+   * silently switched blocking off: the stored name matched nothing, `blocking`
+   * fell back to '', and the page went from 110 within-tissue comparisons to 95
+   * that include Kidney-vs-Liver, with no message and nothing to click to
+   * explain it. A factor's identity is its position; its name is a label on it.
+   */
+  const [blockFactorIdx, setBlockFactorIdx] = useState(-1)
+  const [scheme, setScheme] = useState<ContrastScheme>('all-pairs')
+
   // run params
   // DESeq2 by default. It is what the studio runs for any comparison the
   // reader asks for later, so defaulting to it means the bundle's own tables
@@ -132,6 +147,17 @@ export default function App() {
     setDesign(d)
     setFactorNames(d.factors.map(f => f.name))
     setRefs(d.factors.map(f => f.levels[0]))
+    /**
+     * Blocking is SUGGESTED, never assumed.
+     *
+     * A design with a many-levelled factor beside a smaller one is the shape
+     * that wants separate fits — eleven tissues by five ages — and a reader who
+     * has just uploaded 275 samples should not have to know the word "block" to
+     * get the right analysis. A design with two or three groups gets '' and
+     * behaves exactly as it always has.
+     */
+    const suggested = suggestBlockFactor(d)
+    setBlockFactorIdx(suggested ? d.factors.findIndex(f => f.name === suggested) : -1)
     const g: Record<string, string> = {}
     samples.forEach((s, i) => { g[s] = d.groups[i] })
     setGroupOf(g)
@@ -209,9 +235,36 @@ export default function App() {
     () => (named ? referenceGroupFor(named, refs, groupLevels) : ''),
     [named, refs, groupLevels])
 
+  /** Blocking is only meaningful once there are two factors to separate. */
+  const blockable = useMemo(
+    () => (named && named.factors.length > 1 ? named.factors : []),
+    [named])
+  const blockIdx = blockFactorIdx >= 0 && blockFactorIdx < blockable.length ? blockFactorIdx : -1
+  const blocking = blockIdx >= 0 ? blockable[blockIdx].name : ''
+
+  /**
+   * The plan when a blocking factor is chosen: one fit per level, and only
+   * contrasts that live inside one. Kept separate from `available` so the
+   * budget downgrade has somewhere to be reported from.
+   */
+  const plan = useMemo(
+    () => (named && blocking
+      // The reference level belongs to the factor being compared INSIDE a block,
+      // which is the one that is not the block.
+      ? blockedContrasts(named, blocking, { scheme, reference: refs[blockIdx === 0 ? 1 : 0] })
+      : null),
+    [named, blocking, blockIdx, scheme, refs])
+
   /** Every contrast worth offering, given the factors and their references. */
   const available: ContrastSpec[] = useMemo(() => {
     if (!named) return []
+    if (plan) {
+      // No interaction and no cross-block pair: neither is answerable by any
+      // one of these fits, and offering a comparison nothing can compute is
+      // how a design page starts lying.
+      return plan.contrasts.filter(c =>
+        [c.numerator, c.denominator].every(g => (groupSizes.get(g) ?? 0) >= 2))
+    }
     const within = named.factors.length > 1 ? withinFactorContrasts(named, refs) : []
     const base = within.length
       ? within
@@ -226,7 +279,7 @@ export default function App() {
         : [c.numerator, c.denominator]
       return gs.every(g => (groupSizes.get(g) ?? 0) >= 2)
     })
-  }, [named, refs, groupLevels, groupSizes, refGroup])
+  }, [named, refs, groupLevels, groupSizes, refGroup, plan])
 
   // Default selection: everything pairwise, plus the interaction if present.
   const effectiveChosen = useMemo(() => {
@@ -270,15 +323,19 @@ export default function App() {
     setRunning(true); setRunErr(null); setResult(null); setZipUrl(null)
     try {
       const covariates = named.factors.map(f => f.name)
+      const bi = blockIdx
       const samples = activeSamples.map(s => {
         const si = counts.samples.indexOf(s)
         const rec: Record<string, string> = { sample: s, group: groupOf[s] }
         named.factors.forEach(f => { rec[f.name] = f.values[si] ?? '' })
-        return rec as { sample: string; group: string }
+        // The block travels as its own column, not as one of the covariates:
+        // R partitions on it before fitting anything.
+        rec.block = bi >= 0 ? (named.factors[bi].values[si] ?? '') : ''
+        return rec as { sample: string; group: string; block: string }
       })
       const requests: ContrastRequest[] = selected.map(c => {
         if (c.kind !== 'interaction') {
-          return { ...c, plus: [c.numerator], minus: [c.denominator] }
+          return { ...c, plus: [c.numerator], minus: [c.denominator], block: c.block ?? '' }
         }
         // (A1B1 - A0B1) - (A1B0 - A0B0) written over group means.
         const [fa, fb] = named.factors
@@ -304,6 +361,7 @@ export default function App() {
       const res = await runAnalysis(input, onLog)
       const files = buildBundleFiles(input, res, {
         project, species, method, covariates,
+        blockFactor: blocking || undefined,
         // The reference the reader actually picked. Not derivable from the
         // contrasts — see referenceGroup.
         control: referenceGroup({ factors: named.factors, groupLevels }, refs),
@@ -415,6 +473,57 @@ export default function App() {
                         <p className="mt-1 text-[11px] text-slate-400">{f.levels.join(' · ')}</p>
                       </div>
                     ))}
+                  </div>
+
+                  {/* SEPARATE FITS. Below the factors because it is a
+                      consequence of them: you decide what the factors are, then
+                      whether one of them is too big a jump to model across. */}
+                  <div className="mt-3 rounded-lg bg-white/70 p-2.5 dark:bg-slate-800/60">
+                    <label className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+                      <b>Fit separately by</b>
+                      <select className="input py-0.5 text-xs" value={String(blockIdx)}
+                        onChange={e => { setBlockFactorIdx(Number(e.target.value)); setChosen(null) }}>
+                        <option value="-1">nothing — one fit over every group</option>
+                        {blockable.map((f, i) => (
+                          <option key={i} value={String(i)}>{f.name} ({f.levels.length} fits)</option>
+                        ))}
+                      </select>
+                      {plan && (
+                        <select className="input py-0.5 text-xs" value={scheme}
+                          onChange={e => { setScheme(e.target.value as ContrastScheme); setChosen(null) }}>
+                          <option value="all-pairs">every pair, later vs earlier</option>
+                          <option value="vs-reference">each level vs the reference</option>
+                          <option value="consecutive">consecutive levels only</option>
+                        </select>
+                      )}
+                    </label>
+
+                    {plan ? (
+                      <>
+                        <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                          <b className="tabular-nums">{plan.contrasts.length} comparisons</b>
+                          {plan.perBlock > 0 && <> — {plan.perBlock} in each of {plan.blocks.length} {blocking} levels</>}.
+                          Each level is fitted on its own, so its dispersion comes from samples
+                          like it. Nothing compares one {blocking} to another: no single fit
+                          answers that, and the fold changes are comparable between them anyway.
+                        </p>
+                        {plan.scheme !== plan.requested && (
+                          <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                            Every pair would be too many tables to put in one bundle, so this is
+                            each level against the reference instead. Pick fewer levels, or export
+                            in more than one run, if you need all of them.
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="mt-1.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                        One fit over every group, which is right when the groups are variants of
+                        one experiment. Separate fits are for a factor whose levels are not
+                        comparable — different tissues, different cell lines — because DESeq2
+                        estimates one dispersion per gene across whatever is in the fit, so the
+                        noisiest level sets the variance for the quietest.
+                      </p>
+                    )}
                   </div>
                 </div>
               ) : (

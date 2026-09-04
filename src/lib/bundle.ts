@@ -7,6 +7,15 @@ export interface BundleParams {
   method: Method
   /** extra per-sample columns (the recovered factors) to carry into samples.csv */
   covariates?: string[]
+  /**
+   * The factor whose levels were fitted separately, when the run was blocked.
+   *
+   * Recorded because it changes what the bundle means and nothing else in it
+   * says so: the DEG tables come from one fit per level rather than one fit
+   * overall, and `normalized_counts.csv` is CPM rather than median-of-ratios
+   * because per-block normalized counts are not comparable between blocks.
+   */
+  blockFactor?: string
   /** gene_id -> symbol, when the source carried both */
   geneNames?: Map<string, string>
   countsUnitNote?: string
@@ -163,9 +172,15 @@ export function buildBundleFiles(
      * column is worth more than nothing being broken yet.
      */
     gene_id_type: params.geneNames?.size ? 'ensembl' : 'symbol',
-    counts_unit: params.countsUnitNote ?? (params.method === 'limma'
+    counts_unit: params.countsUnitNote ?? (params.method === 'limma' || params.blockFactor
       ? 'CPM (library-size normalized)'
       : 'DESeq2 normalized (median-of-ratios)'),
+    /**
+     * Not in schema v1; ignored by a reader that does not know it. A studio
+     * that does know it can say that a comparison BETWEEN blocks was never
+     * fitted, rather than leaving the reader to infer it from the contrast list.
+     */
+    block_factor: params.blockFactor ?? null,
     n_samples: input.samples.length,
     contrasts: ordered.map(c => ({
       id: c.id,
@@ -179,6 +194,7 @@ export function buildBundleFiles(
       // Not in schema v1; ignored by a reader that does not know it, and the
       // only way to tell an interaction table from a pairwise one after export.
       kind: c.kind,
+      block: c.block ?? null,
     })),
   }
 

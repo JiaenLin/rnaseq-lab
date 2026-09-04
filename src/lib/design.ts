@@ -104,6 +104,13 @@ export interface ContrastSpec {
   label: string
   kind: 'pairwise' | 'interaction'
   coef?: string                      // interaction terms: the DESeq2 coefficient
+  /**
+   * The block this contrast is answered inside, when the run is blocked.
+   *
+   * Absent means the whole dataset is one fit, which is the default and the
+   * only thing that existed before. See `blockedContrasts`.
+   */
+  block?: string
 }
 
 export const contrastId = (num: string, den: string) =>
@@ -185,4 +192,182 @@ export function interactionContrast(d: Design, refs: string[]): ContrastSpec | n
     kind: 'interaction',
     coef: `${a.name}${aAlt}.${b.name}${bAlt}`,
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * BLOCKING — one fit per level of a factor, contrasts only within it.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A factor whose levels must not share a fit.
+ *
+ * The 2x2 above is the design this app was written for, and one fit over every
+ * group is right for it. An organism-wide study is a different shape: eleven
+ * tissues x five ages is 55 groups over 275 samples, and putting them in one
+ * `~ 0 + grp` asks DESeq2 for a single dispersion per gene spanning brain and
+ * brown fat. DESeq2 has no group-specific dispersion — Michael Love: "there is
+ * not a way to have group-specific dispersion values with DESeq2" — so the
+ * noisy tissues raise the estimate for the quiet ones. On a two-tissue dataset
+ * with unequal within-group variance that cost the quiet tissue ~3,000 DE genes
+ * down to 4, while the noisy one went ~4,000 up to ~8,000
+ * (support.bioconductor.org/p/67202). Love names the condition himself:
+ * "subsetting to only pairs of groups for running DESeq() can be useful when
+ * the within-group variance is very different across groups."
+ *
+ * THIS IS NOT the thing that was reverted in `c6cd494`. Narrowing the fit to
+ * whatever groups a contrast happened to name made the same comparison change
+ * its p-value depending on what else was ticked beside it. A BLOCK is a
+ * declared, stable partition of the samples: every contrast inside one comes
+ * from that block's single fit, so the invariant survives — one fit, then
+ * per-contrast extraction — it is just stated per block rather than once
+ * globally. Ticking a different contrast still cannot move an existing one.
+ *
+ * Blocking is opt-in and off by default. A bundle with four groups must keep
+ * behaving exactly as it does today.
+ */
+
+/** How the levels inside one block are paired up. */
+export type ContrastScheme = 'all-pairs' | 'vs-reference' | 'consecutive'
+
+export interface BlockedPlan {
+  contrasts: ContrastSpec[]
+  /** Block levels that carried at least two comparable groups, in level order. */
+  blocks: string[]
+  /** The scheme actually used — `requested`, unless the budget forced a downgrade. */
+  scheme: ContrastScheme
+  requested: ContrastScheme
+  /** Contrasts per block, when every block has the same shape. */
+  perBlock: number
+}
+
+/** The group label carrying a given level on each named factor, if any sample does. */
+function groupWith(d: Design, assign: [number, string][]): string | null {
+  for (let s = 0; s < d.groups.length; s++) {
+    let ok = true
+    for (const [fi, lv] of assign) {
+      if (d.factors[fi]?.values[s] !== lv) { ok = false; break }
+    }
+    if (ok) return d.groups[s]
+  }
+  return null
+}
+
+/**
+ * Contrasts within each level of a blocking factor.
+ *
+ * ORDER IS THE DIRECTION. The groups inside a block are enumerated by the
+ * remaining factors' LEVEL order, and a pair is always written later-vs-earlier
+ * — `104w vs 008w`, never the reverse. On a time course that makes every
+ * log2 fold change read "up with age", so the sign means one thing across all
+ * 110 tables. Reorder the factor's levels and the direction follows; that is
+ * the control, and it is the same one the reference dropdown already uses.
+ *
+ * `all-pairs` is the default because a fixed young reference is not the only
+ * question a time course asks. 8 weeks is a barely-mature mouse, so 008w→026w
+ * carries maturation as well as ageing, and the transition a lifespan study is
+ * usually about — 060w→104w — is not any of the four reference-anchored
+ * contrasts. Blocking is what makes asking for all of them affordable: within a
+ * block it is C(5,2) = 10, and across blocks 110, where the same appetite over
+ * the ungrouped 55 groups would be C(55,2) = 1,485.
+ *
+ * The budget is a guard against that second number, not against the first. Past
+ * it the scheme downgrades to `vs-reference` and says so, rather than quietly
+ * emitting a bundle nobody can download.
+ */
+export function blockedContrasts(
+  d: Design,
+  blockFactor: string,
+  opts: { scheme?: ContrastScheme; reference?: string; budget?: number } = {},
+): BlockedPlan {
+  const requested = opts.scheme ?? 'all-pairs'
+  const budget = opts.budget ?? 150
+  const empty: BlockedPlan = {
+    contrasts: [], blocks: [], scheme: requested, requested, perBlock: 0,
+  }
+
+  const bi = d.factors.findIndex(f => f.name === blockFactor)
+  if (bi < 0 || d.factors.length < 2) return empty
+
+  const otherIdx = d.factors.map((_, i) => i).filter(i => i !== bi)
+  // Every combination of the remaining factors, in their own level order — so
+  // the enumeration is the design's order, not the order sample names happen
+  // to appear in.
+  const combos = otherIdx.reduce<string[][]>(
+    (acc, oi) => acc.flatMap(prefix => d.factors[oi].levels.map(l => [...prefix, l])), [[]])
+
+  /** The comparable groups inside one block, in level order. */
+  const membersOf = (block: string) => {
+    const seen = new Set<string>()
+    const out: { group: string; within: string }[] = []
+    for (const combo of combos) {
+      const g = groupWith(d, [[bi, block], ...otherIdx.map((oi, k) => [oi, combo[k]] as [number, string])])
+      if (!g || seen.has(g)) continue
+      seen.add(g)
+      out.push({ group: g, within: combo.join('_') })
+    }
+    return out
+  }
+
+  const blocks = d.factors[bi].levels.filter(b => membersOf(b).length >= 2)
+  if (!blocks.length) return empty
+
+  // Count before building, so a downgrade never materialises the list it is
+  // meant to avoid.
+  const sizes = blocks.map(b => membersOf(b).length)
+  const countFor = (s: ContrastScheme) => sizes.reduce(
+    (a, k) => a + (s === 'all-pairs' ? (k * (k - 1)) / 2 : k - 1), 0)
+  const scheme: ContrastScheme =
+    requested === 'all-pairs' && countFor('all-pairs') > budget ? 'vs-reference' : requested
+
+  const contrasts: ContrastSpec[] = []
+  for (const block of blocks) {
+    const members = membersOf(block)
+    const pairs: [number, number][] = []      // [laterIdx, earlierIdx]
+    if (scheme === 'consecutive') {
+      for (let i = 0; i + 1 < members.length; i++) pairs.push([i + 1, i])
+    } else if (scheme === 'vs-reference') {
+      // The reader's reference level when this block has it, else the first —
+      // a block missing the reference still gets a complete set of contrasts
+      // rather than none.
+      const r = Math.max(0, members.findIndex(m => m.within === opts.reference))
+      for (let i = 0; i < members.length; i++) if (i !== r) pairs.push([i, r])
+    } else {
+      for (let i = 0; i < members.length; i++) {
+        for (let j = i + 1; j < members.length; j++) pairs.push([j, i])
+      }
+    }
+    for (const [hi, lo] of pairs) {
+      const num = members[hi], den = members[lo]
+      contrasts.push({
+        id: contrastId(num.group, den.group),
+        numerator: num.group,
+        denominator: den.group,
+        label: `${num.within} vs ${den.within} (in ${block})`,
+        kind: 'pairwise',
+        block,
+      })
+    }
+  }
+
+  const perBlock = sizes.every(k => k === sizes[0])
+    ? (scheme === 'all-pairs' ? (sizes[0] * (sizes[0] - 1)) / 2 : sizes[0] - 1)
+    : 0
+  return { contrasts, blocks, scheme, requested, perBlock }
+}
+
+/**
+ * Which factor, if any, looks like it wants its own fits.
+ *
+ * Suggested rather than imposed: this returns a candidate for the UI to offer,
+ * and the reader decides. The test is structural — a factor with at least three
+ * levels, in a design that has another factor to compare within — because the
+ * cost of a wrong guess here is a bundle fitted eleven ways when one would have
+ * done, and the reader can see the design better than a heuristic can.
+ */
+export function suggestBlockFactor(d: Design): string | null {
+  if (d.factors.length < 2) return null
+  const cand = d.factors
+    .filter(f => f.levels.length >= 3)
+    .sort((a, b) => b.levels.length - a.levels.length)[0]
+  return cand && d.factors.some(f => f !== cand && f.levels.length >= 2) ? cand.name : null
 }
