@@ -88,13 +88,17 @@ export default function App() {
   const [chosen, setChosen] = useState<Set<string> | null>(null)
 
   /**
-   * The factor fitted separately, if any. '' is "one fit over everything" —
+   * The factor fitted separately, if any. -1 is "one fit over everything" —
    * the default, and what every design smaller than an atlas wants.
    *
-   * Held as a factor NAME rather than an index so renaming a factor does not
-   * silently move the blocking to a different one.
+   * Held as an INDEX, because that is what survives the reader renaming a
+   * factor. Keeping the name here instead meant typing "tissue" over "factor1"
+   * silently switched blocking off: the stored name matched nothing, `blocking`
+   * fell back to '', and the page went from 110 within-tissue comparisons to 95
+   * that include Kidney-vs-Liver, with no message and nothing to click to
+   * explain it. A factor's identity is its position; its name is a label on it.
    */
-  const [blockFactor, setBlockFactor] = useState('')
+  const [blockFactorIdx, setBlockFactorIdx] = useState(-1)
   const [scheme, setScheme] = useState<ContrastScheme>('all-pairs')
 
   // run params
@@ -152,7 +156,8 @@ export default function App() {
      * get the right analysis. A design with two or three groups gets '' and
      * behaves exactly as it always has.
      */
-    setBlockFactor(suggestBlockFactor(d) ?? '')
+    const suggested = suggestBlockFactor(d)
+    setBlockFactorIdx(suggested ? d.factors.findIndex(f => f.name === suggested) : -1)
     const g: Record<string, string> = {}
     samples.forEach((s, i) => { g[s] = d.groups[i] })
     setGroupOf(g)
@@ -232,9 +237,10 @@ export default function App() {
 
   /** Blocking is only meaningful once there are two factors to separate. */
   const blockable = useMemo(
-    () => (named && named.factors.length > 1 ? named.factors.map(f => f.name) : []),
+    () => (named && named.factors.length > 1 ? named.factors : []),
     [named])
-  const blocking = blockable.includes(blockFactor) ? blockFactor : ''
+  const blockIdx = blockFactorIdx >= 0 && blockFactorIdx < blockable.length ? blockFactorIdx : -1
+  const blocking = blockIdx >= 0 ? blockable[blockIdx].name : ''
 
   /**
    * The plan when a blocking factor is chosen: one fit per level, and only
@@ -243,9 +249,11 @@ export default function App() {
    */
   const plan = useMemo(
     () => (named && blocking
-      ? blockedContrasts(named, blocking, { scheme, reference: refs[named.factors.findIndex(f => f.name === blocking) === 0 ? 1 : 0] })
+      // The reference level belongs to the factor being compared INSIDE a block,
+      // which is the one that is not the block.
+      ? blockedContrasts(named, blocking, { scheme, reference: refs[blockIdx === 0 ? 1 : 0] })
       : null),
-    [named, blocking, scheme, refs])
+    [named, blocking, blockIdx, scheme, refs])
 
   /** Every contrast worth offering, given the factors and their references. */
   const available: ContrastSpec[] = useMemo(() => {
@@ -315,7 +323,7 @@ export default function App() {
     setRunning(true); setRunErr(null); setResult(null); setZipUrl(null)
     try {
       const covariates = named.factors.map(f => f.name)
-      const bi = named.factors.findIndex(f => f.name === blocking)
+      const bi = blockIdx
       const samples = activeSamples.map(s => {
         const si = counts.samples.indexOf(s)
         const rec: Record<string, string> = { sample: s, group: groupOf[s] }
@@ -473,11 +481,11 @@ export default function App() {
                   <div className="mt-3 rounded-lg bg-white/70 p-2.5 dark:bg-slate-800/60">
                     <label className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                       <b>Fit separately by</b>
-                      <select className="input py-0.5 text-xs" value={blocking}
-                        onChange={e => { setBlockFactor(e.target.value); setChosen(null) }}>
-                        <option value="">nothing — one fit over every group</option>
-                        {blockable.map((n, i) => (
-                          <option key={n} value={n}>{n} ({named.factors[i].levels.length} fits)</option>
+                      <select className="input py-0.5 text-xs" value={String(blockIdx)}
+                        onChange={e => { setBlockFactorIdx(Number(e.target.value)); setChosen(null) }}>
+                        <option value="-1">nothing — one fit over every group</option>
+                        {blockable.map((f, i) => (
+                          <option key={i} value={String(i)}>{f.name} ({f.levels.length} fits)</option>
                         ))}
                       </select>
                       {plan && (

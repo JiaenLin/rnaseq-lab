@@ -188,6 +188,23 @@ check('and C(11,2) is reachable when the budget allows it',
 check('none of which crosses an age',
   byAge.contrasts.filter(c => ageOf(c.numerator) !== ageOf(c.denominator)).length, 0)
 
+// RENAMING A FACTOR MUST NOT MOVE OR LOSE THE BLOCKING.
+//
+// The App holds the blocking factor by INDEX for this reason. It held a name
+// once, and typing "tissue" over "factor1" silently dropped blocking: the
+// stored name matched nothing, and the page went from 110 within-tissue
+// comparisons back to 95 that include Kidney-vs-Liver, with nothing on screen
+// saying why. This checks the half that lives here — that the planner keys off
+// the name it is handed, so a renamed design plans identically.
+const renamed = { ...atlas, factors: atlas.factors.map((f, i) => ({ ...f, name: ['tissue', 'age'][i] })) }
+const byName = blockedContrasts(renamed, 'tissue', { scheme: 'all-pairs', reference: '008w' })
+check('a renamed factor still blocks the same way',
+  [byName.contrasts.length, byName.blocks.length], [110, 11])
+check('and produces exactly the same contrasts',
+  byName.contrasts.map(c => c.id), all.contrasts.map(c => c.id))
+check('the stale name matches nothing, rather than silently blocking elsewhere',
+  blockedContrasts(renamed, 'factor1', {}).contrasts.length, 0)
+
 // Degenerate shapes must return nothing rather than something wrong.
 const oneFactor = detectFactors(['KO_1', 'KO_2', 'WT_1', 'WT_2'])
 check('a one-factor design cannot be blocked',
