@@ -83,9 +83,27 @@ export async function getWebR(onLog: (m: string) => void): Promise<any> {
       if (!self.crossOriginIsolated) onLog('⚠ not cross-origin isolated yet — the page may reload once.')
       onLog('Loading webR (R 4.6.0)…')
       const mod: any = await import(/* @vite-ignore */ WEBR_URL)
-      const webR = new mod.WebR()
+      /**
+       * There is no memory or CPU dial to turn here, and it is worth saying so
+       * rather than leaving someone to look for one. webR is a single wasm32
+       * thread: no BLAS, no parallelism, a 4 GB address ceiling, and no heap
+       * option in its API. The browser will be several times slower than native
+       * R on the same data and the only real lever is doing less work.
+       *
+       * What CAN be chosen is the transport. With cross-origin isolation the
+       * channel is backed by SharedArrayBuffer; without it webR falls back to a
+       * service-worker channel where every eval and every FS write is an
+       * order of magnitude dearer — which on a run that writes a 29 MB matrix
+       * and reads back 110 tables is the difference between slow and unusable.
+       * GitHub Pages cannot send COOP/COEP, so coi-serviceworker.js installs a
+       * worker and reloads once; until that lands, isolation is off.
+       */
+      const webR = new mod.WebR({ interactive: false })
       await webR.init()
-      onLog('webR ready.')
+      onLog(self.crossOriginIsolated
+        ? 'webR ready (cross-origin isolated — fast SharedArrayBuffer channel).'
+        : 'webR ready — NOT cross-origin isolated, so the slow channel is in use. '
+          + 'Reload the page once to let the service worker enable it.')
       return webR
     })()
   }
@@ -218,7 +236,7 @@ const LIMMA_R = String.raw`local({
       tt <- topTable(f2, number = Inf, sort.by = "none")
       write.csv(data.frame(gene_id = rownames(tt), gene_name = rownames(tt),
                 baseMean = round(2^tt$AveExpr, 3), log2FoldChange = round(tt$logFC, 4),
-                lfcSE = NA, pvalue = tt$P.Value, padj = tt$adj.P.Val),
+                lfcSE = NA, pvalue = signif(tt$P.Value, 4), padj = signif(tt$adj.P.Val, 4)),
                 sprintf("/work/deg_%d.csv", i), row.names = FALSE)
       out <- c(out, sprintf("%s=%d", con$id[i], sum(tt$adj.P.Val < 0.05, na.rm = TRUE)))
     }
@@ -231,6 +249,42 @@ const DESEQ_R = String.raw`local({
   suppressMessages(library(DESeq2))
   __RECODE__
   counts <- round(counts); storage.mode(counts) <- "integer"
+
+  # Where the time goes, reported back so a slow browser run can be diagnosed
+  # instead of guessed at. Native R on 275 samples: fits 38 s, ashr 46 s,
+  # results() 17 s, IO 5 s.
+  .t0 <- Sys.time(); .acc <- c()
+  tick <- function(lbl) {
+    now <- Sys.time()
+    .acc[[lbl]] <<- (if (is.null(.acc[[lbl]])) 0 else .acc[[lbl]]) +
+      as.numeric(difftime(now, .t0, units = "secs"))
+    .t0 <<- now
+  }
+  tick("read+prep")
+
+  # DROP GENES NO BLOCK WILL FIT, ONCE, BEFORE ANYTHING ELSE.
+  #
+  # Each block filters again below, so this changes no result — it only removes
+  # rows that every block would have removed anyway. On the 11-tissue atlas that
+  # is 10,966 of 34,514 (32%), including 1,742 that are zero in all 275 samples.
+  # They were being carried through the whole run: held in the matrix, copied
+  # into each block's subset, and written into normalized_counts.csv. In wasm,
+  # where the address space is 4 GB and there is no swap, peak memory is the
+  # thing most likely to end a large run outright.
+  #
+  # It also makes normalized_counts.csv mean one thing — genes detectable in at
+  # least one block — instead of depending on whether the run was blocked.
+  anyKeep <- rep(FALSE, nrow(counts))
+  for (b in blocks) {
+    sel <- which(cd$block == b)
+    if (!length(sel)) next
+    gb <- droplevels(grp[sel])
+    anyKeep <- anyKeep | (rowSums(counts[, sel, drop = FALSE] >= 10) >= max(2, min(table(gb))))
+  }
+  fitnote <- c(fitnote, sprintf("%d of %d genes are detectable in at least one block",
+                                sum(anyKeep), length(anyKeep)))
+  counts <- counts[anyKeep, , drop = FALSE]
+  tick("prefilter")
 
   # WHAT normalized_counts.csv HOLDS DEPENDS ON WHETHER THE RUN IS BLOCKED.
   #
@@ -278,6 +332,7 @@ const DESEQ_R = String.raw`local({
     dds <- DESeqDataSetFromMatrix(cb, cd2, ~ 0 + grp)
     dds <- tryCatch(DESeq(dds, quiet = TRUE),
                     error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
+    tick("DESeq() fits")
 
     if (length(blocks) == 1) {
       # Median-of-ratios over EVERY gene, not just the fitted ones.
@@ -332,6 +387,7 @@ const DESEQ_R = String.raw`local({
       cv[m] <- cv[m] - 1
       bm <- cmean(cv)
       res <- results(dds, contrast = cv, filter = bm)
+      tick("results()")
       # SHRINK THE FOLD CHANGES. The raw MLE is wildly inflated for low-count
       # genes, which is why DESeq2 puts lfcShrink next to results() in its own
       # quickstart. apeglm cannot take a contrast vector - the vignette says so
@@ -352,9 +408,16 @@ const DESEQ_R = String.raw`local({
               lfcShrink(dds, contrast = cv, type = "ashr", res = res)),
             error = function(e) NULL)
       if (!is.null(sh)) { res <- sh; shrunk <- shrunk + 1L }
+      tick("lfcShrink (ashr)")
+      # p-values at 4 significant figures. R writes them at full double
+      # precision — 0.0435007582036718 is eighteen characters where five would
+      # do — and across 110 tables of 17k rows those two columns are a third of
+      # the bundle. Four figures rather than three keeps ranked lists from
+      # gaining ties, and no threshold anyone applies can tell the difference.
       write.csv(data.frame(gene_id = rownames(res), gene_name = rownames(res),
                 baseMean = round(bm, 3), log2FoldChange = round(res$log2FoldChange, 4),
-                lfcSE = round(res$lfcSE, 4), pvalue = res$pvalue, padj = res$padj,
+                lfcSE = round(res$lfcSE, 4),
+                pvalue = signif(res$pvalue, 4), padj = signif(res$padj, 4),
                 log2FoldChange_MLE = round(mle, 4), lfcSE_MLE = round(mleSE, 4)),
                 sprintf("/work/deg_%d.csv", i), row.names = FALSE)
       out <- c(out, sprintf("%s=%d", con$id[i], sum(res$padj < 0.05, na.rm = TRUE)))
@@ -363,6 +426,9 @@ const DESEQ_R = String.raw`local({
   }
   fitnote <- c(fitnote, sprintf("per-contrast filter; ashr shrinkage on %d of %d contrasts",
                                 shrunk, ncon))
+  tick("write tables")
+  fitnote <- c(fitnote, paste0("time: ", paste(sprintf("%s %.1fs", names(.acc), unlist(.acc)),
+                                               collapse = " | ")))
   writeLines(fitnote, "/work/fit.txt")
   paste(out, collapse = "|")
 })`
