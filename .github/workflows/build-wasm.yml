@@ -16,6 +16,11 @@ on:
 
 permissions:
   contents: write
+  # Needed to dispatch the deploy workflow below. Without it the default token
+  # gets HTTP 403 "Resource not accessible by integration" — which is exactly
+  # what happened, and the `|| echo` that used to be on that step swallowed it
+  # so the build still went green with the binaries unpublished.
+  actions: write
 
 jobs:
   build:
@@ -41,11 +46,13 @@ jobs:
             echo "no changes to commit"
           fi
       # A push made with GITHUB_TOKEN does NOT trigger other workflows — GitHub
-      # blocks that to prevent recursion. So the deploy that would SERVE these
+      # blocks that to prevent recursion. Not tolerated with `|| true`: a build
+      # that produces binaries nobody serves is a failure, and hiding it behind
+      # a green tick is how it went unnoticed the first time. So the deploy that would SERVE these
       # binaries never fires on its own, and the build goes green while the
       # files stay unpublished. It did exactly that on the apeglm build, which
       # had to be published by hand. Runs even when nothing was committed.
       - name: Publish the rebuilt repo
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run "Deploy to GitHub Pages" --ref main || echo "no Pages workflow to run"
+        run: gh workflow run "Deploy to GitHub Pages" --ref main
