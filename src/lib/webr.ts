@@ -1,3 +1,4 @@
+import { blocksOf, cpmCsv, mapLimit, poolSize, splitByBlock } from './parallel'
 // webR loader + differential-expression engines (limma-voom, DESeq2), all in-browser.
 
 export type Method = 'limma' | 'deseq2'
@@ -77,12 +78,29 @@ const LOCFIT_REPO = new URL('wasm/', document.baseURI).href.replace(/\/$/, '')
 let webRPromise: Promise<any> | null = null
 const installed = new Set<string>()
 
+/**
+ * An ADDITIONAL webR instance — its own worker, its own R, its own heap.
+ *
+ * Deliberately not the shared singleton above: that one is reused across
+ * uploads and holds any state a previous run left behind, which is exactly what
+ * a pool must not share. These are created for one run and closed after it.
+ */
+async function spawnWebR(mod: any): Promise<any> {
+  const webR = new mod.WebR({ interactive: false })
+  await webR.init()
+  return webR
+}
+
+/** The module handle, so extra instances do not re-import it. */
+let webRModule: Promise<any> | null = null
+const getModule = () => (webRModule ??= import(/* @vite-ignore */ WEBR_URL))
+
 export async function getWebR(onLog: (m: string) => void): Promise<any> {
   if (!webRPromise) {
     webRPromise = (async () => {
       if (!self.crossOriginIsolated) onLog('⚠ not cross-origin isolated yet — the page may reload once.')
       onLog('Loading webR (R 4.6.0)…')
-      const mod: any = await import(/* @vite-ignore */ WEBR_URL)
+      const mod: any = await getModule()
       /**
        * There is no memory or CPU dial to turn here, and it is worth saying so
        * rather than leaving someone to look for one. webR is a single wasm32
@@ -131,6 +149,19 @@ export function ensureObjectPackages(webR: any, needsDESeq2: boolean, onLog: (m:
     : install(webR, 'se', ['SummarizedExperiment'], onLog,
         'Installing SummarizedExperiment to open the object…')
 }
+
+/**
+ * Packages for one POOL WORKER, quietly and without the shared `installed` set.
+ *
+ * That set is a per-module memo of what the singleton has installed; a fresh
+ * instance has installed nothing, so consulting it would skip the install and
+ * leave the worker without DESeq2. Each instance has its own virtual
+ * filesystem and has to be furnished separately.
+ */
+export const installFor = (webR: any, method: Method) =>
+  webR.installPackages(method === 'limma' ? ['limma'] : ['DESeq2', 'ashr'], {
+    repos: [LOCFIT_REPO, 'https://bioc.r-universe.dev', 'https://repo.r-wasm.org'],
+  })
 
 const ensurePackages = (webR: any, method: Method, onLog: (m: string) => void) =>
   method === 'limma'
@@ -199,10 +230,13 @@ const LIMMA_R = String.raw`local({
   # CPM over EVERY sample, before any block is taken apart. A share of the
   # library is comparable between blocks in a way no per-block model quantity
   # is; see the DESeq2 path below for why that matters.
-  cpm <- t(t(counts) / colSums(counts)) * 1e6
-  write.csv(data.frame(gene_id = rownames(cpm), gene_name = rownames(cpm),
-            round(as.data.frame(cpm), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
-  rm(cpm)
+  writeNorm <- __WRITENORM__
+  if (writeNorm) {
+    cpm <- t(t(counts) / colSums(counts)) * 1e6
+    write.csv(data.frame(gene_id = rownames(cpm), gene_name = rownames(cpm),
+              round(as.data.frame(cpm), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
+    rm(cpm)
+  }
 
   out <- character(0)
   for (b in blocks) {
@@ -222,6 +256,7 @@ const LIMMA_R = String.raw`local({
     fitnote <- c(fitnote, sprintf("%s: %d samples, %d groups, %d of %d genes",
                                   if (nzchar(b)) b else "all", length(sel),
                                   nlevels(gb), sum(keep), length(keep)))
+    if (!writeNorm) writeLines(rownames(cb)[keep], "/work/kept.txt")
     v <- voom(cb[keep, , drop = FALSE], design)
     fit <- lmFit(v, design)
 
@@ -274,6 +309,15 @@ const DESEQ_R = String.raw`local({
   #
   # It also makes normalized_counts.csv mean one thing — genes detectable in at
   # least one block — instead of depending on whether the run was blocked.
+  # LIBRARY SIZE IS WHAT WAS SEQUENCED, so the CPM denominator is taken over
+  # every gene, before anything is dropped. Only the totals are kept, not a
+  # second copy of the matrix — the prefilter below exists to hold peak memory
+  # down and computing CPM first would undo it. limma already normalises this
+  # way, and lib/parallel.ts computes the same denominator when a pool assembles
+  # the matrix, so all three agree to the last digit.
+  libTotals <- colSums(counts)
+  libTotals[libTotals <= 0] <- 1
+
   anyKeep <- rep(FALSE, nrow(counts))
   for (b in blocks) {
     sel <- which(cd$block == b)
@@ -296,8 +340,14 @@ const DESEQ_R = String.raw`local({
   # is each gene's share of its library and means the same thing in every
   # block. An unblocked run keeps median-of-ratios exactly as before.
   # meta.json records which, in counts_unit.
-  if (length(blocks) > 1) {
-    cpm <- t(t(counts) / colSums(counts)) * 1e6
+  # writeNorm is FALSE when this session is ONE WORKER OF SEVERAL. A worker
+  # holds only its own block's columns, so it cannot write a matrix spanning
+  # every sample and must not try; lib/parallel.ts assembles CPM from the whole
+  # file instead. It writes the genes it fitted, and the caller unions those
+  # across workers to decide which rows that matrix carries.
+  writeNorm <- __WRITENORM__
+  if (writeNorm && length(blocks) > 1) {
+    cpm <- t(t(counts) / libTotals) * 1e6
     write.csv(data.frame(gene_id = rownames(cpm), gene_name = rownames(cpm),
               round(as.data.frame(cpm), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
     rm(cpm)
@@ -334,7 +384,8 @@ const DESEQ_R = String.raw`local({
                     error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
     tick("DESeq() fits")
 
-    if (length(blocks) == 1) {
+    if (!writeNorm) writeLines(rownames(cb), "/work/kept.txt")
+    if (writeNorm && length(blocks) == 1) {
       # Median-of-ratios over EVERY gene, not just the fitted ones.
       #
       # This used to write counts(dds, normalized = TRUE), which is the matrix
@@ -435,12 +486,62 @@ const DESEQ_R = String.raw`local({
 
 const csvEsc = (s: string) => JSON.stringify(String(s))
 
+/**
+ * One R session, over whatever samples and contrasts it is handed.
+ *
+ * Both paths below go through here: the single-instance run passes everything,
+ * and each pool worker passes one block. `writeNorm` says which of them owns
+ * normalized_counts.csv — a worker holding 25 of 275 columns cannot write it.
+ */
+async function runSession(
+  webR: any,
+  input: AnalysisInput,
+  writeNorm: boolean,
+): Promise<{ degCsv: string[]; nDeg: Map<string, number>; notes: string[]; kept: string[] }> {
+  const idxOf = (g: string) => input.groupLevels.indexOf(g) + 1
+  const enc = new TextEncoder()
+  const dec = new TextDecoder()
+  try { await webR.FS.mkdir('/work') } catch { /* exists */ }
+  await webR.FS.writeFile('/work/counts.csv', enc.encode(input.countsCsv))
+  await webR.FS.writeFile('/work/coldata.csv', enc.encode('sample,group,block\n' +
+    input.samples.map(s =>
+      `${csvEsc(s.sample)},${csvEsc(s.group)},${csvEsc(s.block ?? '')}`).join('\n') + '\n'))
+  await webR.FS.writeFile('/work/levels.txt', enc.encode(input.groupLevels.join('\n') + '\n'))
+  const rows = input.contrasts.map(c =>
+    [csvEsc(c.id), csvEsc(c.plus.map(idxOf).join(';')), csvEsc(c.minus.map(idxOf).join(';')),
+     csvEsc(c.block ?? '')].join(','))
+  await webR.FS.writeFile('/work/contrasts.csv',
+    enc.encode('id,plus,minus,block\n' + rows.join('\n') + '\n'))
+
+  const script = (input.method === 'limma' ? LIMMA_R : DESEQ_R)
+    .replaceAll('__RECODE__', RECODE_R)
+    .replaceAll('__WRITENORM__', writeNorm ? 'TRUE' : 'FALSE')
+  const summary: string = await webR.evalRString(script)
+
+  const nDeg = new Map(summary.split('|').filter(Boolean).map(kv => {
+    const i = kv.lastIndexOf('=')
+    return [kv.slice(0, i), parseInt(kv.slice(i + 1), 10) || 0] as const
+  }))
+  let notes: string[] = []
+  try {
+    notes = dec.decode(await webR.FS.readFile('/work/fit.txt')).split('\n').filter(Boolean)
+  } catch { /* engine wrote no note */ }
+  let kept: string[] = []
+  if (!writeNorm) {
+    try {
+      kept = dec.decode(await webR.FS.readFile('/work/kept.txt')).split('\n').filter(Boolean)
+    } catch { /* nothing fitted */ }
+  }
+  const degCsv: string[] = []
+  for (let i = 0; i < input.contrasts.length; i++) {
+    degCsv.push(dec.decode(await webR.FS.readFile(`/work/deg_${i + 1}.csv`)))
+  }
+  return { degCsv, nDeg, notes, kept }
+}
+
 export async function runAnalysis(
   input: AnalysisInput, onLog: (m: string) => void, webRIn?: any,
 ): Promise<AnalysisResult> {
-  const webR = webRIn ?? await getWebR(onLog)
-  await ensurePackages(webR, input.method, onLog)
-
   const idxOf = (g: string) => input.groupLevels.indexOf(g) + 1
   const bad = input.contrasts.find(c => [...c.plus, ...c.minus].some(g => idxOf(g) === 0))
   if (bad) throw new Error(`Contrast "${bad.label}" names a group that no sample has.`)
@@ -455,51 +556,97 @@ export async function runAnalysis(
   if (strayed) throw new Error(
     `Contrast "${strayed.label}" spans more than one block, so no single fit answers it.`)
 
-  try { await webR.FS.mkdir('/work') } catch { /* exists */ }
-  const enc = new TextEncoder()
-  await webR.FS.writeFile('/work/counts.csv', enc.encode(input.countsCsv))
+  const blocks = blocksOf(input.samples)
+  const engine = input.method === 'limma' ? 'limma-voom' : 'DESeq2'
+  const workers = webRIn ? 1 : poolSize(blocks.length)
 
-  const coldata = 'sample,group,block\n' +
-    input.samples.map(s =>
-      `${csvEsc(s.sample)},${csvEsc(s.group)},${csvEsc(s.block ?? '')}`).join('\n') + '\n'
-  await webR.FS.writeFile('/work/coldata.csv', enc.encode(coldata))
-  await webR.FS.writeFile('/work/levels.txt', enc.encode(input.groupLevels.join('\n') + '\n'))
-
-  // Contrasts travel as 1-based level indices, so no group label is ever parsed by R.
-  const rows = input.contrasts.map(c =>
-    [csvEsc(c.id), csvEsc(c.plus.map(idxOf).join(';')), csvEsc(c.minus.map(idxOf).join(';')),
-     csvEsc(c.block ?? '')].join(','))
-  await webR.FS.writeFile('/work/contrasts.csv',
-    enc.encode('id,plus,minus,block\n' + rows.join('\n') + '\n'))
-
-  const nBlocks = new Set(input.samples.map(s => s.block ?? '')).size
-  onLog(`Running ${input.method === 'limma' ? 'limma-voom' : 'DESeq2'} — `
-    + `${input.contrasts.length} contrast(s)`
-    + (nBlocks > 1 ? ` across ${nBlocks} blocks (${nBlocks} fits)…` : '…'))
-  const script = (input.method === 'limma' ? LIMMA_R : DESEQ_R).replace('__RECODE__', RECODE_R)
-  const summary: string = await webR.evalRString(script)
-
-  const nDegOf = new Map(summary.split('|').filter(Boolean).map(kv => {
-    const i = kv.lastIndexOf('=')
-    return [kv.slice(0, i), parseInt(kv.slice(i + 1), 10) || 0] as const
-  }))
-
-  const dec = new TextDecoder()
-  try {
-    dec.decode(await webR.FS.readFile('/work/fit.txt')).split('\n')
-      .filter(Boolean).forEach(l => onLog(l))
-  } catch { /* engine wrote no note */ }
-  const contrasts: ContrastResult[] = []
-  for (let i = 0; i < input.contrasts.length; i++) {
-    const c = input.contrasts[i]
-    contrasts.push({
-      id: c.id, label: c.label, numerator: c.numerator, denominator: c.denominator, kind: c.kind,
-      block: c.block,
-      degCsv: dec.decode(await webR.FS.readFile(`/work/deg_${i + 1}.csv`)),
-      nDeg: nDegOf.get(c.id) ?? 0,
-    })
+  /* ---------- one instance: unblocked runs, and small blocked ones ---------- */
+  if (workers <= 1) {
+    const webR = webRIn ?? await getWebR(onLog)
+    await ensurePackages(webR, input.method, onLog)
+    onLog(`Running ${engine} — ${input.contrasts.length} contrast(s)`
+      + (blocks.length > 1 ? ` across ${blocks.length} blocks (${blocks.length} fits)…` : '…'))
+    const r = await runSession(webR, input, true)
+    r.notes.forEach(onLog)
+    const contrasts = input.contrasts.map((c, i) => ({
+      id: c.id, label: c.label, numerator: c.numerator, denominator: c.denominator,
+      kind: c.kind, block: c.block, degCsv: r.degCsv[i], nDeg: r.nDeg.get(c.id) ?? 0,
+    }))
+    const normCsv = new TextDecoder().decode(await webR.FS.readFile('/work/norm.csv'))
+    onLog(`Done — ${contrasts.length} contrast(s) at padj < 0.05.`)
+    return { contrasts, normCsv }
   }
-  const normCsv = dec.decode(await webR.FS.readFile('/work/norm.csv'))
-  onLog(`Done — ${contrasts.map(c => `${c.label}: ${c.nDeg}`).join(' · ')} DEGs at padj < 0.05.`)
+
+  /* ---------- a pool: one worker per block, several at a time ---------- */
+  //
+  // INSTALL ONCE, THEN FAN OUT. The first instance fetches DESeq2 over the
+  // network; the rest find those tarballs in the browser's HTTP cache. Doing it
+  // the other way costs N times the download on a cold cache and puts N
+  // concurrent installs on the critical path — the one part of this that is
+  // reasoned rather than measured, and the cheapest thing to keep off it.
+  const jobs = splitByBlock(input.countsCsv, input.samples, input.contrasts)
+  onLog(`Running ${engine} — ${input.contrasts.length} contrasts over ${jobs.length} blocks `
+    + `on ${workers} workers (${blocks.length} independent fits).`)
+
+  const mod = await getModule()
+  const lead = webRIn ?? await getWebR(onLog)
+  await ensurePackages(lead, input.method, onLog)
+
+  const pool: any[] = [lead]
+  if (workers > 1) {
+    onLog(`Starting ${workers - 1} more R worker(s)…`)
+    const extra = await Promise.all(
+      Array.from({ length: workers - 1 }, async () => {
+        const w = await spawnWebR(mod)
+        await installFor(w, input.method)
+        return w
+      }))
+    pool.push(...extra)
+  }
+
+  const degCsv = new Array<string>(input.contrasts.length)
+  const nDeg = new Map<string, number>()
+  const keptAll = new Set<string>()
+  let done = 0
+  try {
+    const results = await mapLimit(jobs, pool.length, async (job, slot) => {
+      const sub: AnalysisInput = {
+        countsCsv: job.countsCsv,
+        samples: input.samples.filter(s => (s.block ?? '') === job.block),
+        groupLevels: input.groupLevels,
+        contrasts: job.contrasts.map(c => c.request),
+        method: input.method,
+      }
+      const r = await runSession(pool[slot], sub, false)
+      onLog(`  [${++done}/${jobs.length}] ${job.block}: `
+        + (r.notes.find(n => n.startsWith(job.block)) ?? `${job.contrasts.length} contrast(s)`))
+      return { job, r }
+    })
+    // Assembled by the ORIGINAL index, so the order never depends on which
+    // worker finished first.
+    for (const { job, r } of results) {
+      job.contrasts.forEach((c, k) => { degCsv[c.index] = r.degCsv[k] })
+      r.nDeg.forEach((v, k) => nDeg.set(k, v))
+      r.kept.forEach(g => keptAll.add(g))
+    }
+  } finally {
+    // Close only what this run created; the shared singleton outlives it.
+    await Promise.all(pool.slice(1).map(w => w.close?.()))
+  }
+
+  const missing = degCsv.findIndex(x => x === undefined)
+  if (missing >= 0) {
+    throw new Error(
+      `No table came back for "${input.contrasts[missing].label}". `
+      + `The run is incomplete, so no bundle was built.`)
+  }
+
+  const contrasts: ContrastResult[] = input.contrasts.map((c, i) => ({
+    id: c.id, label: c.label, numerator: c.numerator, denominator: c.denominator,
+    kind: c.kind, block: c.block, degCsv: degCsv[i], nDeg: nDeg.get(c.id) ?? 0,
+  }))
+  onLog(`Assembling normalized counts over ${keptAll.size.toLocaleString()} genes…`)
+  const normCsv = cpmCsv(input.countsCsv, keptAll)
+  onLog(`Done — ${contrasts.length} contrasts from ${jobs.length} fits on ${pool.length} workers.`)
   return { contrasts, normCsv }
 }
