@@ -35,5 +35,17 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           rm -rf wasm-repo/.gitignore
           git add wasm-repo
-          git commit -m "Build locfit + apeglm WASM binaries" || { echo "no changes"; exit 0; }
-          git push
+          if git commit -m "Build locfit + apeglm WASM binaries"; then
+            git push
+          else
+            echo "no changes to commit"
+          fi
+      # A push made with GITHUB_TOKEN does NOT trigger other workflows — GitHub
+      # blocks that to prevent recursion. So the deploy that would SERVE these
+      # binaries never fires on its own, and the build goes green while the
+      # files stay unpublished. It did exactly that on the apeglm build, which
+      # had to be published by hand. Runs even when nothing was committed.
+      - name: Publish the rebuilt repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "Deploy to GitHub Pages" --ref main || echo "no Pages workflow to run"
