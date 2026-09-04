@@ -6,7 +6,7 @@
 // means, and check the number that comes out is the quantity the label claims.
 import {
   detectFactors, withinFactorContrasts, interactionContrast,
-  blockedContrasts, suggestBlockFactor,
+  blockedContrasts, contrastId,
 } from '../src/lib/design.ts'
 
 let failed = 0
@@ -128,7 +128,6 @@ const atlas = detectFactors(ATLAS)
 check('the atlas reads as 11 x 5', atlas.factors.map(f => f.levels.length), [11, 5])
 check('and 55 groups over 275 samples',
   [atlas.groupLevels.length, atlas.groups.length], [55, 275])
-check('the many-levelled factor is the one suggested', suggestBlockFactor(atlas), 'factor1')
 
 const all = blockedContrasts(atlas, 'factor1', { scheme: 'all-pairs', reference: '008w' })
 check('every pair within a tissue is C(5,2) x 11', all.contrasts.length, 110)
@@ -209,8 +208,6 @@ check('the stale name matches nothing, rather than silently blocking elsewhere',
 const oneFactor = detectFactors(['KO_1', 'KO_2', 'WT_1', 'WT_2'])
 check('a one-factor design cannot be blocked',
   blockedContrasts(oneFactor, 'factor1', {}).contrasts.length, 0)
-check('and suggests no blocking', suggestBlockFactor(oneFactor), null)
-check('a 2x2 suggests no blocking either', suggestBlockFactor(d), null)
 check('an unknown factor name blocks nothing',
   blockedContrasts(atlas, 'nope', {}).contrasts.length, 0)
 
@@ -227,6 +224,30 @@ check('a ragged design blocks on what each level actually has',
 check('and names no group that has no samples',
   rp.contrasts.every(c => ragged.groupLevels.includes(c.numerator)
     && ragged.groupLevels.includes(c.denominator)), true)
+
+
+/* ------------------------------------------------------------------ *
+ * CONTRAST IDS ARE FILE NAMES.
+ *
+ * `deg_<id>.csv` is a key in the bundle's file map, so two contrasts
+ * sharing an id means one table silently overwrites the other while
+ * meta.json goes on listing both.
+ * ------------------------------------------------------------------ */
+console.log('\nCONTRAST IDS')
+
+const dirty = ['A B', 'A_B', 'A/B', 'A:B', 'A,B', 'A;B', 'A%B', 'A(B)']
+const madeIds = dirty.map(g => contrastId(g, 'CTRL'))
+check('eight labels that once collapsed to one id are now distinct',
+  new Set(madeIds).size, dirty.length)
+check('a clean label keeps a clean id', contrastId('KO_Cold', 'WT_Cold'), 'KO_Cold_vs_WT_Cold')
+check('so does one using the characters R tolerates',
+  contrastId('517E2+RSL3', '517E2'), '517E2+RSL3_vs_517E2')
+check('a sanitised label is marked, not silently rewritten',
+  /^A_B_vs_CTRL-[a-z0-9]{1,5}$/.test(contrastId('A B', 'CTRL')), true)
+check('and the mark is stable across calls',
+  contrastId('A B', 'CTRL'), contrastId('A B', 'CTRL'))
+check('ids stay file-name safe',
+  madeIds.every(x => /^[A-Za-z0-9._+-]+$/.test(x)), true)
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll contrast tests passed\n')
 process.exit(failed ? 1 : 0)

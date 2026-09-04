@@ -14,6 +14,8 @@
 // So: split the group labels on their separators, and keep a position as a
 // FACTOR when it varies and is not a restatement of another position.
 
+import { groupsFor } from './groups.ts'
+
 export interface Factor {
   name: string                       // "factor1" until the user renames it
   levels: string[]
@@ -58,7 +60,10 @@ const partitionKey = (col: string[]) => {
  * cannot be tested and showing it invites someone to try.
  */
 export function detectFactors(samples: string[]): Design {
-  const groups = samples.map(stripReplicate)
+  // The progressive strip from groups.ts, not `stripReplicate`. See groupsFor:
+  // the single-regex rule merged "shArf1-1" and "shArf1-2" into one group
+  // whenever the names carried no replicate suffix of their own.
+  const groups = groupsFor(samples)
   const groupLevels = [...new Set(groups)]
 
   // A design is only recoverable if every label splits the same way.
@@ -113,8 +118,34 @@ export interface ContrastSpec {
   block?: string
 }
 
-export const contrastId = (num: string, den: string) =>
-  `${num}_vs_${den}`.replace(/[^A-Za-z0-9._+-]+/g, '_')
+/**
+ * A file-safe id for one comparison — and it must not lose which comparison.
+ *
+ * `deg_<id>.csv` is a key in the bundle's file map, so two contrasts sharing an
+ * id means the second table OVERWRITES the first while meta.json goes on listing
+ * both. The sanitiser collapses everything outside `[A-Za-z0-9._+-]` to `_`, and
+ * seven perfectly ordinary labels land on one id:
+ *
+ *   "A B", "A_B", "A/B", "A:B", "A,B", "A;B", "A%B"  ->  A_B_vs_CTRL
+ *
+ * Group names like `IFN-g/TNF` or `Dose 5%` are not exotic. So when sanitising
+ * actually changed the string, a short hash of the ORIGINAL is appended: clean
+ * names keep clean ids, and only the ones that lost information pay for it.
+ */
+const shortHash = (text: string): string => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36).slice(0, 5)
+}
+
+export const contrastId = (num: string, den: string) => {
+  const raw = `${num}_vs_${den}`
+  const safe = raw.replace(/[^A-Za-z0-9._+-]+/g, '_')
+  return safe === raw ? safe : `${safe}-${shortHash(raw)}`
+}
 
 /** Every level against one reference. What a one-factor design asks. */
 export function pairwiseContrasts(levels: string[], reference: string): ContrastSpec[] {
@@ -353,21 +384,4 @@ export function blockedContrasts(
     ? (scheme === 'all-pairs' ? (sizes[0] * (sizes[0] - 1)) / 2 : sizes[0] - 1)
     : 0
   return { contrasts, blocks, scheme, requested, perBlock }
-}
-
-/**
- * Which factor, if any, looks like it wants its own fits.
- *
- * Suggested rather than imposed: this returns a candidate for the UI to offer,
- * and the reader decides. The test is structural — a factor with at least three
- * levels, in a design that has another factor to compare within — because the
- * cost of a wrong guess here is a bundle fitted eleven ways when one would have
- * done, and the reader can see the design better than a heuristic can.
- */
-export function suggestBlockFactor(d: Design): string | null {
-  if (d.factors.length < 2) return null
-  const cand = d.factors
-    .filter(f => f.levels.length >= 3)
-    .sort((a, b) => b.levels.length - a.levels.length)[0]
-  return cand && d.factors.some(f => f !== cand && f.levels.length >= 2) ? cand.name : null
 }

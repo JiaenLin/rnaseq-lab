@@ -168,5 +168,31 @@ console.log('\nTHE REST OF THE CONTRACT')
     pairwiseContrasts(design.groupLevels, referenceGroupFor(design, ['008w'])).length, 4)
 }
 
+
+/* ------------------------------------------------------------------ *
+ * NO TWO COMPARISONS MAY SHARE A FILE.
+ * ------------------------------------------------------------------ */
+console.log('\nONE FILE PER COMPARISON')
+{
+  const mk = id => ({ id, label: id, numerator: 'X', denominator: 'Y', kind: 'pairwise',
+    degCsv: 'gene_id,gene_name,baseMean,log2FoldChange,lfcSE,pvalue,padj\nG1,G1,1,0,0,1,1\n', nDeg: 0 })
+  const input = { countsCsv: 'gene_id,a,b\nG1,1,2\n',
+    samples: [{ sample: 'a', group: 'X' }, { sample: 'b', group: 'Y' }],
+    groupLevels: ['X', 'Y'], contrasts: [], method: 'deseq2' }
+  let msg = null
+  try {
+    buildBundleFiles(input, { contrasts: [mk('same_id'), mk('same_id')], normCsv: input.countsCsv },
+      { project: 'p', species: 'mouse', method: 'deseq2' })
+  } catch (e) { msg = String(e.message) }
+  check('a duplicated contrast id is refused rather than overwriting a table',
+    msg !== null && /same file name/.test(msg), true)
+
+  const okFiles = buildBundleFiles(input, { contrasts: [mk('a_vs_b'), mk('c_vs_d')], normCsv: input.countsCsv },
+    { project: 'p', species: 'mouse', method: 'deseq2' })
+  check('two distinct ids give two tables',
+    ['deg_a_vs_b.csv', 'deg_c_vs_d.csv'].every(f => f in okFiles), true)
+}
+
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll bundle tests passed\n')
 process.exit(failed ? 1 : 0)
+

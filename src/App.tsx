@@ -5,13 +5,14 @@ import {
   type AnalysisResult, type Method, type ContrastRequest,
 } from './lib/webr'
 import { buildBundleFiles, referenceGroup, referenceGroupFor, zipBundle } from './lib/bundle'
-import { parseMatrix } from './lib/matrix'
+import { parseMatrix, probeFromCsv, type Probe } from './lib/matrix'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
   detectFactors, pairwiseContrasts, withinFactorContrasts, interactionContrast,
-  blockedContrasts, suggestBlockFactor,
+  blockedContrasts,
   type Design, type ContrastSpec, type ContrastScheme,
 } from './lib/design'
+import { suggestBlockFactor, separationByFactor, SEPARATION_THRESHOLD } from './lib/blocking'
 
 const EXPLORER_URL = 'https://jiaenlin.github.io/rnaseq-studio/'
 
@@ -46,6 +47,8 @@ type Step = 'upload' | 'design' | 'run' | 'result'
 
 interface Counts {
   countsCsv: string
+  /** thinned numeric counts, for lib/blocking.ts */
+  probe: Probe
   samples: string[]
   nGenes: number
   geneNames: Map<string, string> | null
@@ -122,6 +125,7 @@ export default function App() {
     samples: string[],
     colData: Record<string, Record<string, string>>,
     colDataColumns: string[],
+    probe: Probe,
   ) => {
     // A sample table that came with the object beats anything guessed from
     // names: it is what the pipeline actually modelled.
@@ -147,17 +151,10 @@ export default function App() {
     setDesign(d)
     setFactorNames(d.factors.map(f => f.name))
     setRefs(d.factors.map(f => f.levels[0]))
-    /**
-     * Blocking is SUGGESTED, never assumed.
-     *
-     * A design with a many-levelled factor beside a smaller one is the shape
-     * that wants separate fits — eleven tissues by five ages — and a reader who
-     * has just uploaded 275 samples should not have to know the word "block" to
-     * get the right analysis. A design with two or three groups gets '' and
-     * behaves exactly as it always has.
-     */
-    const suggested = suggestBlockFactor(d)
-    setBlockFactorIdx(suggested ? d.factors.findIndex(f => f.name === suggested) : -1)
+    // Suggested from the DATA, never from the shape of the names — see
+    // lib/blocking.ts. With no probe this is null, i.e. one fit for everything.
+    const suggested = suggestBlockFactor(d, probe)
+    setBlockFactorIdx(suggested ? suggested.index : -1)
     const g: Record<string, string> = {}
     samples.forEach((s, i) => { g[s] = d.groups[i] })
     setGroupOf(g)
@@ -178,8 +175,9 @@ export default function App() {
           countsCsv: obj.countsCsv, samples: obj.samples, nGenes: obj.nGenes,
           geneNames: null, origin: obj.source,
           colData: obj.colData, colDataColumns: obj.colDataColumns,
+          probe: probeFromCsv(obj.countsCsv),
         })
-        seedDesign(obj.samples, obj.colData, obj.colDataColumns)
+        seedDesign(obj.samples, obj.colData, obj.colDataColumns, probeFromCsv(obj.countsCsv))
       } else {
         const text = await f.text()
         const parsed = Papa.parse<string[]>(text.trim(), { skipEmptyLines: true })
@@ -191,8 +189,9 @@ export default function App() {
             ? `matrix (${m.annotationColumns.join(' + ')} read as annotation)`
             : 'matrix',
           colData: {}, colDataColumns: [],
+          probe: m.probe,
         })
-        seedDesign(m.samples, {}, [])
+        seedDesign(m.samples, {}, [], m.probe)
       }
       setStep('design')
     } catch (e: any) {
@@ -240,6 +239,19 @@ export default function App() {
     () => (named && named.factors.length > 1 ? named.factors : []),
     [named])
   const blockIdx = blockFactorIdx >= 0 && blockFactorIdx < blockable.length ? blockFactorIdx : -1
+
+  /**
+   * How far apart each factor's levels sit — the number behind the suggestion.
+   *
+   * Shown rather than kept private, because "fit these separately" is a claim
+   * about the data and the reader is entitled to the evidence. It is also the
+   * only thing on the page that distinguishes eleven tissues from six
+   * timepoints, which look identical from the sample names.
+   */
+  const seps = useMemo(
+    () => (named && counts?.probe ? separationByFactor(named, counts.probe) : []),
+    [named, counts])
+  const sepOf = (i: number) => seps.find(x => x.index === i)?.separation
   const blocking = blockIdx >= 0 ? blockable[blockIdx].name : ''
 
   /**
@@ -485,7 +497,10 @@ export default function App() {
                         onChange={e => { setBlockFactorIdx(Number(e.target.value)); setChosen(null) }}>
                         <option value="-1">nothing — one fit over every group</option>
                         {blockable.map((f, i) => (
-                          <option key={i} value={String(i)}>{f.name} ({f.levels.length} fits)</option>
+                          <option key={i} value={String(i)}>
+                            {f.name} ({f.levels.length} fits){
+                              sepOf(i) != null ? ` · separation ${sepOf(i)!.toFixed(1)}` : ''}
+                          </option>
                         ))}
                       </select>
                       {plan && (
@@ -506,6 +521,11 @@ export default function App() {
                           Each level is fitted on its own, so its dispersion comes from samples
                           like it. Nothing compares one {blocking} to another: no single fit
                           answers that, and the fold changes are comparable between them anyway.
+                          {sepOf(blockIdx) != null && (
+                            <> Its levels explain <b>{sepOf(blockIdx)!.toFixed(0)}×</b> more variance
+                              between them than within, against a threshold of {SEPARATION_THRESHOLD};
+                              that is why this is offered and the other factor is not.</>
+                          )}
                         </p>
                         {plan.scheme !== plan.requested && (
                           <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
@@ -522,6 +542,11 @@ export default function App() {
                         comparable — different tissues, different cell lines — because DESeq2
                         estimates one dispersion per gene across whatever is in the fit, so the
                         noisiest level sets the variance for the quietest.
+                        {seps.length > 0 && (
+                          <> Nothing here separates enough to need it: {seps.map(x =>
+                            `${x.name} ${x.separation.toFixed(1)}`).join(', ')} — all under{' '}
+                            {SEPARATION_THRESHOLD}.</>
+                        )}
                       </p>
                     )}
                   </div>

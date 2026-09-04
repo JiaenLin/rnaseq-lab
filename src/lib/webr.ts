@@ -280,7 +280,16 @@ const DESEQ_R = String.raw`local({
                     error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
 
     if (length(blocks) == 1) {
-      nc <- counts(dds, normalized = TRUE)
+      # Median-of-ratios over EVERY gene, not just the fitted ones.
+      #
+      # This used to write counts(dds, normalized = TRUE), which is the matrix
+      # AFTER the expression filter — so an unblocked bundle carried ~15k genes
+      # in normalized_counts.csv while a blocked one carried all 34k, and the
+      # same engine shipped a different gene set depending on a setting that has
+      # nothing to do with which genes exist. Applying the size factors to the
+      # unfiltered matrix is the same normalisation over the full annotation, so
+      # a gene the model declined to test can still be plotted.
+      nc <- sweep(counts[, sel, drop = FALSE], 2, sizeFactors(dds), "/")
       write.csv(data.frame(gene_id = rownames(nc), gene_name = rownames(nc),
                 round(as.data.frame(nc), 3), check.names = FALSE), "/work/norm.csv", row.names = FALSE)
       rm(nc)
