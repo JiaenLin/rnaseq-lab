@@ -51,6 +51,25 @@ export function detectGroups(samples: string[]): DetectedGroup[] {
   return groupBy(samples, null)
 }
 
+/**
+ * The group for each sample, in sample order.
+ *
+ * `detectFactors` used to do this itself with a single regex whose replicate
+ * marker was optional — `[_.\- ](?:r|rep|replicate)?\d+$` — which is the greedy
+ * rule this module exists to avoid, and it was the LIVE one: nothing outside
+ * this file's own test ever called `detectGroups`. Two implementations of one
+ * decision, and the careful, documented, tested one was the dead one.
+ *
+ * So the progressive strip is now what the app runs, and the tests below cover
+ * the code that ships.
+ */
+export function groupsFor(samples: string[]): string[] {
+  const detected = detectGroups(samples)
+  const byName = new Map<string, string>()
+  for (const g of detected) for (const s of g.samples) byName.set(s, g.name)
+  return samples.map(s => byName.get(s) ?? s)
+}
+
 /** True when detection actually found a design rather than giving up. */
 export const isUsableDetection = (groups: DetectedGroup[], samples: string[]) =>
   groups.length > 1 && groups.length < samples.length

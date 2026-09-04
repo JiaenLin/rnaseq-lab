@@ -117,5 +117,50 @@ const BAT = [
   check('duplicate partition collapsed', d.factors.length, 1)
 }
 
+
+/* ------------------------------------------------------------------ *
+ * INPUTS THAT WOULD CORRUPT THE RUN ARE REFUSED AT THE DOOR.
+ * ------------------------------------------------------------------ */
+console.log('\nREFUSED INPUTS')
+
+const throws = (name, rows, rx) => {
+  let msg = null
+  try { parseMatrix(rows) } catch (e) { msg = String(e.message) }
+  const ok = msg !== null && rx.test(msg)
+  if (!ok) failed++
+  console.log(`${ok ? '  ok  ' : '  FAIL'} ${name}${ok ? '' : `\n        got ${JSON.stringify(msg)}`}`)
+}
+
+// Proven in R: counts[, cd$sample] resolves both "s1" columns to the first,
+// so the second library's numbers are replaced with no error anywhere.
+throws('duplicate sample names are refused',
+  [['gene_id', 's1', 's1', 's2'], ['G1', '1', '2', '3'], ['G2', '4', '5', '6']],
+  /[Dd]uplicate sample/)
+// R refuses these itself, but only after the upload and without naming the file.
+throws('duplicate gene ids are refused',
+  [['gene_id', 'a', 'b'], ['G1', '1', '2'], ['G1', '3', '4']],
+  /[Dd]uplicate gene/)
+// Correctly quoted, and every naive splitter downstream still mis-reads it.
+throws('a comma in a sample name is refused',
+  [['gene_id', 'ctrl,rep1', 'b'], ['G1', '1', '2'], ['G2', '3', '4']],
+  /comma, quote or line break/)
+throws('so is a quote',
+  [['gene_id', 'ct"rl', 'b'], ['G1', '1', '2'], ['G2', '3', '4']],
+  /comma, quote or line break/)
+
+check('a clean matrix still parses',
+  parseMatrix([['gene_id', 'a', 'b'], ['G1', '1', '2'], ['G2', '3', '4']]).samples, ['a', 'b'])
+
+console.log('\nPROBE')
+const big = [['gene_id', 'a', 'b', 'c']]
+for (let i = 0; i < 5000; i++) big.push([`G${i}`, String(i), String(i + 1), String(i + 2)])
+const pb = parseMatrix(big)
+check('the probe is thinned to a bound', pb.probe.nGenes <= 2000, true)
+check('and spans every sample', pb.probe.nSamples, 3)
+check('the full matrix is untouched', pb.nGenes, 5000)
+check('probe values are the counts, not text',
+  pb.probe.values[0] >= 0 && Number.isFinite(pb.probe.values[0]), true)
+
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll matrix/design tests passed\n')
 process.exit(failed ? 1 : 0)
+

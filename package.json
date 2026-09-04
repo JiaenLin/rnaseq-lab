@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node scripts/test-groups.mjs && node scripts/test-matrix.mjs && node scripts/test-contrasts.mjs && node scripts/test-bundle.mjs && node scripts/test-engines.mjs",
+    "test": "node scripts/test-groups.mjs && node scripts/test-matrix.mjs && node scripts/test-contrasts.mjs && node scripts/test-blocking.mjs && node scripts/test-bundle.mjs && node scripts/test-engines.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

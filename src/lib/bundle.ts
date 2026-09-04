@@ -213,6 +213,21 @@ export function buildBundleFiles(
     // export — DESeq2 models raw counts, not normalized ones.
     'raw_counts.csv': enc.encode(reshapeCounts(input.countsCsv, params.geneNames)),
   }
+  /**
+   * Two contrasts cannot share a file.
+   *
+   * `contrastId` now hashes anything it had to sanitise, so this should be
+   * unreachable — which is exactly why it is checked. The failure it guards
+   * against is silent and total: the map key is the filename, so a collision
+   * drops one table on the floor while meta.json keeps advertising both, and
+   * the studio then draws one comparison under two names.
+   */
+  const dup = ordered.map(c => c.id).filter((id, i, a) => a.indexOf(id) !== i)
+  if (dup.length) {
+    throw new Error(
+      `Two comparisons resolved to the same file name (${[...new Set(dup)].join(', ')}), ` +
+      `so one table would overwrite the other. This is a bug — please report the group names.`)
+  }
   for (const c of ordered) {
     files[`deg_${c.id}.csv`] = enc.encode(
       params.geneNames ? reshapeDeg(c.degCsv, params.geneNames) : c.degCsv)
