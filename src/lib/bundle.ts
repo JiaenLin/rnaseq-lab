@@ -5,6 +5,8 @@ export interface BundleParams {
   project: string
   species: string
   method: Method
+  /** 'apeglm' or 'none' — recorded because it changes every fold change. */
+  shrink?: 'none' | 'apeglm'
   /** extra per-sample columns (the recovered factors) to carry into samples.csv */
   covariates?: string[]
   /**
@@ -181,6 +183,12 @@ export function buildBundleFiles(
      * fitted, rather than leaving the reader to infer it from the contrast list.
      */
     block_factor: params.blockFactor ?? null,
+    /**
+     * Which estimator log2FoldChange holds. 'none' means it is the maximum
+     * likelihood estimate; 'apeglm' means the shrunken posterior, with the MLE
+     * still in log2FoldChange_MLE beside it. ashr is never used.
+     */
+    shrinkage: params.shrink ?? 'none',
     n_samples: input.samples.length,
     contrasts: ordered.map(c => ({
       id: c.id,

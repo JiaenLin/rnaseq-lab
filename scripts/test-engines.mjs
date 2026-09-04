@@ -33,6 +33,13 @@ function haveR() {
     return out.trim() === 'TRUE'
   } catch { return false }
 }
+const HAVE_APEGLM = (() => {
+  try {
+    return execFileSync('Rscript', ['-e', 'cat("apeglm" %in% rownames(installed.packages()))'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'TRUE'
+  } catch { return false }
+})()
+
 if (!haveR()) {
   console.log('\nENGINES\n  --   R with DESeq2 + limma + ashr not found; skipping\n')
   process.exit(0)
@@ -51,10 +58,11 @@ const RECODE = lift('RECODE_R')
 // sample; the single-instance path does. replaceAll, because the token also
 // appears in a comment and .replace would substitute that one instead — which
 // is exactly the bug this line once shipped.
-const engine = (name, writeNorm = true) =>
+const engine = (name, writeNorm = true, shrink = 'none') =>
   lift(name)
     .replaceAll('__RECODE__', RECODE)
     .replaceAll('__WRITENORM__', writeNorm ? 'TRUE' : 'FALSE')
+    .replaceAll('__SHRINK__', shrink)
     .replaceAll('/work/', `${WORK}/`)
 
 /* ---------- a dataset whose blocks differ in within-group variance ---------- */
@@ -182,18 +190,38 @@ check('and the quiet block loses more than the noisy one gains or loses',
   (degBlocked[0] - degPooled[0]) > Math.abs(degBlocked[1] - degPooled[1]), true)
 check('blocked recovers most of the truth in the quiet block', degBlocked[0] > NDE * 0.8, true)
 
-/* ---------- the MLE column ---------- */
+/* ---------- shrinkage is apeglm or nothing ---------- */
 const head1 = readFileSync(join(WORK, 'deg_1.csv'), 'utf8').split('\n')[0].replace(/"/g, '')
 check('the unshrunk MLE ships beside the shrunk estimate',
   ['log2FoldChange', 'lfcSE', 'log2FoldChange_MLE', 'lfcSE_MLE'].every(c => head1.split(',').includes(c)), true)
-const r2 = readFileSync(join(WORK, 'deg_1.csv'), 'utf8').trim().split('\n')
-const cols = r2[0].replace(/"/g, '').split(',')
-const iSh = cols.indexOf('log2FoldChange'), iMle = cols.indexOf('log2FoldChange_MLE')
-const shrinkPairs = r2.slice(1).map(l => l.split(',')).filter(c => c[iSh] !== 'NA' && c[iMle] !== 'NA')
-check('shrinkage actually moved the estimates',
-  shrinkPairs.some(c => Math.abs(Number(c[iSh]) - Number(c[iMle])) > 1e-6), true)
-check('and shrinkage pulls toward zero, never away',
-  shrinkPairs.every(c => Math.abs(Number(c[iSh])) <= Math.abs(Number(c[iMle])) + 1e-3), true)
+const pairsOf = f => {
+  const t = readFileSync(join(WORK, f), 'utf8').trim().split('\n')
+  const cols = t[0].replace(/"/g, '').split(',')
+  const iSh = cols.indexOf('log2FoldChange'), iMle = cols.indexOf('log2FoldChange_MLE')
+  return t.slice(1).map(l => l.split(',')).filter(c => c[iSh] !== 'NA' && c[iMle] !== 'NA')
+    .map(c => [Number(c[iSh]), Number(c[iMle])])
+}
+// Default is NO shrinkage: the exported fold change IS the MLE, exactly.
+check('with shrinkage off the two columns are identical',
+  pairsOf('deg_1.csv').every(([sh, mle]) => Math.abs(sh - mle) < 1e-9), true)
+
+if (HAVE_APEGLM) {
+  writeInputs(true)
+  runR(engine('DESEQ_R', true, 'apeglm'))
+  const p = pairsOf('deg_1.csv')
+  check('apeglm actually moved the estimates',
+    p.some(([sh, mle]) => Math.abs(sh - mle) > 1e-6), true)
+  check('and it pulls toward zero, never away',
+    p.every(([sh, mle]) => Math.abs(sh) <= Math.abs(mle) + 1e-3), true)
+  // The failure that motivated dropping ashr: it left genes with zero counts
+  // in one group carrying |log2FC| above 20, essentially unshrunk.
+  check('no unbounded estimate survives shrinkage',
+    p.every(([sh]) => Math.abs(sh) < 15), true)
+  writeInputs(true)
+  runR(engine('DESEQ_R', true, 'none'))
+} else {
+  console.log('  --   apeglm not installed; its path is skipped')
+}
 
 /* ---------- normalized_counts depends on blocking ---------- */
 writeInputs(true)
