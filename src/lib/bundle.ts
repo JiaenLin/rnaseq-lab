@@ -1,6 +1,6 @@
 import { zipSync } from 'fflate'
 import type { AnalysisInput, AnalysisResult, Method } from './webr'
-import type { DtuResult } from './dtu'
+import type { DteResult } from './dtu'
 import { transcriptsCsv, type TranscriptAnn, type CategoryVocabulary } from './longread.ts'
 
 /**
@@ -13,8 +13,16 @@ export interface IsoformOutput {
   transcripts?: readonly TranscriptAnn[]
   /** Which vocabulary `structural_category` speaks. See longread.ts. */
   vocabulary?: CategoryVocabulary
-  /** contrast id -> the DTE and DTU tables for that pair. */
-  byContrast: Record<string, DtuResult>
+  /** contrast id -> transcript-level DESeq2 for that pair. */
+  byContrast: Record<string, DteResult>
+  /**
+   * contrast id -> the pipeline's DEXSeq table, when one was supplied.
+   *
+   * Separate from byContrast because it has a different provenance: DTE is
+   * fitted here, DTU is DEXSeq's, computed by the pipeline and carried through.
+   * A bundle can have the first without the second.
+   */
+  dtuByContrast?: Record<string, string>
 }
 
 export interface BundleParams {
@@ -238,7 +246,7 @@ export function buildBundleFiles(
       dte_files: Object.fromEntries(
         Object.keys(isoform.byContrast).map(id => [id, `dte_${id}.csv`])),
       dtu_files: Object.fromEntries(
-        Object.keys(isoform.byContrast).map(id => [id, `dtu_${id}.csv`])),
+        Object.keys(isoform.dtuByContrast ?? {}).map(id => [id, `dtu_${id}.csv`])),
       /**
        * Which vocabulary `structural_category` in transcripts.csv speaks —
        * bambu's own class strings, SQANTI3's categories, or a partial join that
@@ -256,17 +264,17 @@ export function buildBundleFiles(
       dte_fit: 'per-contrast, on that contrast\'s samples only',
       /** DTU engine, named because a satuRn bundle would not be comparable. */
       /**
-       * Named because a different engine's numbers are not comparable, and this
-       * one is deliberately NOT the engine the ONT pipeline runs: DEXSeq imports
-       * Rsamtools, which has no WebAssembly build, so it cannot load in a browser.
+       * Absent when no DTU table is present. When present it is always DEXSeq
+       * and always the PIPELINE's — this app does not fit a usage model, because
+       * DEXSeq cannot load in webR (Rsamtools has no wasm build) and reporting a
+       * different engine's numbers under DTU's name would be worse than
+       * reporting none. See src/lib/dtu.ts.
        */
-      dtu_engine: 'satuRn',
-      /**
-       * What `usage_effect` in dtu_*.csv is measured in. satuRn fits a
-       * quasi-binomial model of each isoform's share, so its effect is a change
-       * in LOG ODDS of usage — not a log2 fold change and not comparable to one.
-       */
-      dtu_effect_scale: 'log-odds of isoform usage (quasi-binomial)',
+      ...(Object.keys(isoform.dtuByContrast ?? {}).length ? {
+        dtu_engine: 'DEXSeq (computed by the pipeline, read here unaltered)',
+        dtu_effect_scale: 'log2 fold change of isoform usage',
+        dtu_gene_padj: "DEXSeq perGeneQValue, from the pipeline's results_dtu_gene.tsv",
+      } : {}),
       dtu_filter: 'total counts >= 10 and >= 3 counts in >= 2 samples',
     } : null,
     contrasts: ordered.map(c => ({
@@ -330,7 +338,9 @@ export function buildBundleFiles(
     }
     for (const [id, r] of Object.entries(isoform.byContrast)) {
       files[`dte_${id}.csv`] = enc.encode(r.dteCsv)
-      files[`dtu_${id}.csv`] = enc.encode(r.dtuCsv)
+    }
+    for (const [id, csv] of Object.entries(isoform.dtuByContrast ?? {})) {
+      files[`dtu_${id}.csv`] = enc.encode(csv)
     }
   }
   return files

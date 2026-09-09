@@ -180,17 +180,16 @@ export const packagesFor = (method: Method, shrink: Shrink): string[] =>
     : shrink === 'apeglm' ? ['DESeq2', 'apeglm'] : ['DESeq2']
 
 /**
- * DESeq2 + satuRn, for the isoform layer.
+ * DESeq2, for the isoform layer's transcript-level fit.
  *
- * satuRn comes from bioc.r-universe.dev, which is already in the repo list, and
- * every one of its dependencies has a WebAssembly build. DEXSeq does not: it
- * imports Rsamtools, which wraps htslib and is not built for wasm anywhere, so
- * it fails at `library()` after the download. Checked against both repo indexes,
- * not assumed.
+ * Just DESeq2 — the same engine as the gene layer, one level down. DEXSeq is
+ * NOT installed: it cannot load in webR at all, for reasons upstream of this
+ * project, and src/lib/dtu.ts records them. Usage results come from the
+ * pipeline that computed them.
  */
 export const installDtu = (webR: any, onLog: (m: string) => void) =>
-  install(webR, 'dtu', ['DESeq2', 'satuRn'], onLog,
-    'Installing DESeq2 and satuRn for the isoform layer… (first run downloads tens of MB, then cached)')
+  install(webR, 'dtu', ['DESeq2'], onLog,
+    'Installing DESeq2 for the isoform layer…')
 
 export const installFor = (webR: any, method: Method, shrink: Shrink) =>
   webR.installPackages(packagesFor(method, shrink), {

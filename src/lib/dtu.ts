@@ -1,79 +1,78 @@
-// Transcript-level differential expression (DTE) and differential transcript
-// usage (DTU), in webR.
+// Transcript-level differential expression (DTE), and differential transcript
+// usage (DTU) read from the pipeline that computed it.
 //
 // A SEPARATE R path on purpose. The gene-level DESEQ_R in webr.ts is verified
 // number-for-number against the studio and against the cluster; nothing here
-// edits it. This module opens its own session, on its own matrix, and writes its
-// own files.
+// edits it.
 //
-// DTE answers "is this isoform present at a different level?" — DESeq2 on
-// transcript rows, same engine, same filter, same shrinkage.
+// ── WHY DTU IS NOT COMPUTED HERE ────────────────────────────────────────────
 //
-// DTU answers the question long reads exist for: "did the MIX change?" A gene
-// can be flat while its isoforms swap.
+// DTU is the question long reads exist for — a gene can be perfectly flat while
+// its dominant isoform swaps — and DEXSeq is the established tool for it, the
+// one Oxford Nanopore's own wf-transcriptomes runs.
 //
-// WHY satuRn AND NOT DEXSeq. DEXSeq is what Oxford Nanopore's own
-// wf-transcriptomes runs, so it was the first choice and a bundle built with it
-// would have been directly comparable to the cluster's own
-// `results_dtu_transcript.tsv`. It cannot run here: DEXSeq `Imports: Rsamtools`,
-// Rsamtools wraps htslib, and **no WebAssembly build of it exists** — not on
-// repo.r-wasm.org, not on bioc.r-universe.dev. `library(DEXSeq)` fails at
-// namespace load with "there is no package called 'Rsamtools'", which is what a
-// live run on the deployed app reported after the gene-level fit had already
-// finished.
+// DEXSeq cannot load in webR, and the blocker is upstream of this project:
 //
-// Of the two alternatives, DRIMSeq needs only locfit (which this app already
-// builds and hosts) and satuRn needs nothing at all. satuRn is chosen: it is
-// built for exactly this scale, and its quasi-binomial model of each isoform's
-// share is the same question DEXSeq asks.
+//   1. DEXSeq declares `import(Rsamtools)` in its NAMESPACE, so `library(DEXSeq)`
+//      needs Rsamtools present — even though DEXSeq calls not one Rsamtools
+//      symbol (grepped across all eight of its R files: zero hits).
+//   2. Rsamtools has no WebAssembly build anywhere: repo.r-wasm.org and three
+//      r-universes, at R 4.4, 4.5 and 4.6.
+//   3. Building it fails, and not for a reason this repo can fix. Rsamtools
+//      links against Rhtslib, and the Rhtslib wasm build ships a `libhts.a`
+//      whose members are HOST objects — `wasm-ld: archive member 'hts.o' is
+//      neither Wasm object file nor LLVM bitcode`, for every member. htslib is
+//      not actually cross-compiled for Emscripten. (Build log: the
+//      "Build the WASM binaries" step of build-wasm.yml, 2026-09-09.)
+//   4. DEXSeq also reaches XML through geneplotter -> annotate, whose NAMESPACE
+//      has `importFrom(XML, ...)`. XML's configure fails its libxml2 link test
+//      under emscripten as well.
 //
-// The cost is stated rather than hidden: **satuRn's numbers are not DEXSeq's**,
-// so a bundle built here is no longer arithmetically comparable to the
-// cluster's table. meta.json names the engine for this reason.
+// So rather than substitute a different engine and report its numbers under
+// DTU's name, this app READS the DEXSeq result the pipeline already produced.
+// wf-transcriptomes writes it whenever `de_analysis` is on:
+//
+//   out/de_analysis/<contrast>/results_dtu_transcript.tsv   per-transcript
+//   out/de_analysis/<contrast>/results_dtu_gene.tsv         perGeneQValue
+//
+// Those are real, unmodified DEXSeq numbers. With no such file the bundle
+// simply carries no DTU — the studio already degrades to the gene and DTE
+// layers — rather than carrying a different test wearing DEXSeq's label.
 
 import type { Shrink } from './webr.ts'
 
-export interface DtuInput {
-  /** `transcript_id,<sample>… ` raw counts, as read from the pipeline. */
+export interface DteInput {
+  /** `transcript_id,<sample>… ` raw counts, rounded, as read from the pipeline. */
   txCountsCsv: string
-  /** transcript_id -> gene_id. Every row of the matrix must be here. */
-  txToGene: Map<string, string>
   samples: { sample: string; group: string }[]
-  /** Exactly two groups. DEXSeq's `~ sample + exon + condition:exon` is a two-level test. */
   numerator: string
   denominator: string
   shrink?: Shrink
 }
 
-export interface DtuResult {
-  /** DESeq2 on transcript rows: transcript_id,baseMean,log2FoldChange,lfcSE,pvalue,padj */
+export interface DteResult {
+  /** transcript_id,baseMean,log2FoldChange,lfcSE,pvalue,padj */
   dteCsv: string
-  /** transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den */
-  dtuCsv: string
   nTested: number
   nDte: number
-  nDtu: number
   notes: string[]
 }
 
 /**
- * The prefilter, stated once and applied to BOTH tests.
+ * The prefilter, stated once.
  *
  * Taken from the cluster's stage 03 so the two are comparable: at least ten
- * counts in total and at least three counts in at least two samples. On this
- * cohort it took 55,852 transcripts to 22,275. It is not a nicety — DEXSeq's
- * cost is roughly linear in features, and a transcript with four reads across
- * six libraries cannot support a usage test whatever the engine.
+ * counts in total and at least three counts in at least two samples. A
+ * transcript with four reads across six libraries cannot support a test.
  */
 export const FILTER_NOTE =
   'at least 10 counts in total and at least 3 counts in at least 2 samples'
 
 const R = String.raw`webr::eval_js('0')
-suppressMessages({ library(DESeq2); library(satuRn); library(SummarizedExperiment) })
+suppressMessages(library(DESeq2))
 
 cnt <- read.csv("/work/tx_counts.csv", row.names = 1, check.names = FALSE)
 cd  <- read.csv("/work/tx_coldata.csv", stringsAsFactors = FALSE)
-t2g <- read.csv("/work/tx2gene.csv", stringsAsFactors = FALSE)
 
 cnt <- cnt[, cd$sample, drop = FALSE]
 # Already integers: the caller rounds bambu's fractional expected counts once,
@@ -92,10 +91,6 @@ cnt  <- cnt[keep, , drop = FALSE]
 notes <- sprintf("filter: %d of %d transcripts kept (%s)",
                  nrow(cnt), length(keep), "__FILTERNOTE__")
 
-gene <- t2g$gene_id[match(rownames(cnt), t2g$transcript_id)]
-gene[is.na(gene)] <- rownames(cnt)[is.na(gene)]
-
-# ---- DTE: DESeq2 on transcript rows -------------------------------------
 dds <- DESeqDataSetFromMatrix(cnt, data.frame(grp = grp, row.names = colnames(cnt)), ~ grp)
 dds <- tryCatch(DESeq(dds, quiet = TRUE),
                 error = function(e) suppressWarnings(DESeq(dds, fitType = "mean", quiet = TRUE)))
@@ -109,116 +104,21 @@ dte <- data.frame(transcript_id = rownames(res), baseMean = res$baseMean,
                   log2FoldChange = res$log2FoldChange, lfcSE = res$lfcSE,
                   pvalue = res$pvalue, padj = res$padj)
 write.csv(dte, "/work/dte.csv", row.names = FALSE, na = "NA")
-
-# ---- DTU: satuRn, a quasi-binomial model of each isoform's SHARE ---------
-# A gene with ONE surviving transcript carries no usage information at all --
-# its single isoform is 100% of the gene in every sample by construction -- and
-# no usage model can fit it. Dropping them here is what keeps the run from
-# failing on a third of the matrix.
-multi <- gene %in% names(which(table(gene) > 1))
-notes <- c(notes, sprintf("DTU: %d transcripts in %d multi-isoform genes",
-                          sum(multi), length(unique(gene[multi]))))
-dtu <- data.frame(transcript_id = character(0), gene_id = character(0),
-                  usage_effect = numeric(0), pvalue = numeric(0), padj = numeric(0),
-                  gene_padj = numeric(0), mean_usage_num = numeric(0),
-                  mean_usage_den = numeric(0))
-if (sum(multi) > 1) {
-  cm <- cnt[multi, , drop = FALSE]
-  gm <- gene[multi]
-
-  tx  <- data.frame(isoform_id = rownames(cm), gene_id = gm, row.names = rownames(cm))
-  cd2 <- data.frame(group = grp, row.names = colnames(cm))
-  se  <- SummarizedExperiment(assays = list(counts = cm), colData = cd2, rowData = tx)
-  se  <- satuRn::fitDTU(object = se, formula = ~ 0 + group, parallel = FALSE, verbose = FALSE)
-
-  design <- model.matrix(~ 0 + group, data = cd2)
-  colnames(design) <- levels(grp)
-  L <- matrix(0, nrow = ncol(design), ncol = 1,
-              dimnames = list(colnames(design), "contrast"))
-  L["__DEN__", 1] <- -1
-  L["__NUM__", 1] <- 1
-  se <- satuRn::testDTU(object = se, contrasts = L,
-                        diagplot1 = FALSE, diagplot2 = FALSE, sort = FALSE)
-  sr <- rowData(se)[["fitDTUResult_contrast"]]
-
-  # satuRn reports a regular FDR and an EMPIRICAL one, and recommends the
-  # empirical for FDR control. On a small design the empirical null can fail to
-  # fit and come back all-NA, so it is used when it exists and the fallback is
-  # recorded rather than silently taken.
-  padj <- sr$empirical_FDR
-  pval <- sr$empirical_pval
-  which_p <- "satuRn empirical"
-  if (all(is.na(padj))) {
-    padj <- sr$regular_FDR; pval <- sr$pval
-    which_p <- "satuRn regular (the empirical null did not fit)"
-  }
-  notes <- c(notes, paste("DTU p-values:", which_p))
-
-  # A per-gene q-value, built rather than borrowed: Simes across a gene's own
-  # transcript p-values, then BH across genes. The minimum transcript padj is
-  # NOT a gene-level q and must not be labelled as one.
-  gid <- as.character(rowData(se)$gene_id)
-  simes <- tapply(pval, gid, function(p) {
-    p <- sort(p[!is.na(p)])
-    if (!length(p)) return(NA_real_)
-    min(length(p) * p / seq_along(p), 1)
-  })
-  gq <- p.adjust(simes, method = "BH")
-
-  # Observed usage per group: each transcript's share of its gene's total.
-  # Written out rather than left to the reader, because a proportion the app
-  # recomputed could disagree with the test that was actually run.
-  #
-  # NAMES MATTER HERE AND ARE NOT AUTOMATIC. ifelse copies the attributes of its
-  # TEST argument, so ifelse(tot > 0, ...) returns a matrix carrying tot's
-  # rownames -- which are GENE ids, duplicated, because tot was built by rowsum.
-  # rowMeans then inherits those, and a transcript-id lookup into a gene-named
-  # vector is NA on every row, with no error anywhere.
-  gtot <- rowsum(cm, gm)
-  share <- function(which) {
-    s <- cm[, which, drop = FALSE]
-    tot <- gtot[match(gm, rownames(gtot)), which, drop = FALSE]
-    stats::setNames(rowMeans(ifelse(tot > 0, s / tot, NA_real_), na.rm = TRUE),
-                    rownames(cm))
-  }
-  un <- share(grp == "__NUM__"); ud <- share(grp == "__DEN__")
-  ids <- as.character(rowData(se)$isoform_id)
-  dtu <- data.frame(
-    transcript_id  = ids,
-    gene_id        = gid,
-    # satuRn's effect is on the quasi-binomial LOGIT scale -- a change in log
-    # odds of usage, not a log2 fold change. Named for what it is; meta.json
-    # records the scale so nothing downstream reads it as a fold change.
-    usage_effect   = as.numeric(sr$estimates),
-    pvalue         = as.numeric(pval),
-    padj           = as.numeric(padj),
-    gene_padj      = as.numeric(gq[gid]),
-    mean_usage_num = as.numeric(un[ids]),
-    mean_usage_den = as.numeric(ud[ids]))
-}
-write.csv(dtu, "/work/dtu.csv", row.names = FALSE, na = "NA")
-
-writeLines(notes, "/work/dtu_notes.txt")
-sprintf("%d|%d|%d", nrow(cnt),
-        sum(!is.na(dte$padj) & dte$padj < 0.05),
-        sum(!is.na(dtu$padj) & dtu$padj < 0.05))`
+writeLines(notes, "/work/dte_notes.txt")
+sprintf("%d|%d", nrow(cnt), sum(!is.na(dte$padj) & dte$padj < 0.05))`
 
 const csvEsc = (s: string) => JSON.stringify(String(s))
 
-/** Run DTE and DTU for one pair of groups. `webR` must already have DTU_PACKAGES. */
-export async function runDtu(
-  webR: any, input: DtuInput, onLog: (m: string) => void,
-): Promise<DtuResult> {
+/** Transcript-level DESeq2 for one pair of groups. Same engine as the gene layer. */
+export async function runDte(
+  webR: any, input: DteInput, onLog: (m: string) => void,
+): Promise<DteResult> {
   const enc = new TextEncoder(); const dec = new TextDecoder()
   try { await webR.FS.mkdir('/work') } catch { /* exists */ }
 
   await webR.FS.writeFile('/work/tx_counts.csv', enc.encode(input.txCountsCsv))
   await webR.FS.writeFile('/work/tx_coldata.csv', enc.encode('sample,group\n' +
     input.samples.map(s => `${csvEsc(s.sample)},${csvEsc(s.group)}`).join('\n') + '\n'))
-  await webR.FS.writeFile('/work/tx2gene.csv', enc.encode('transcript_id,gene_id\n' +
-    [...input.txToGene].map(([t, g]) => `${csvEsc(t)},${csvEsc(g)}`).join('\n') + '\n'))
-
-  onLog('Running DESeq2 on transcripts, then satuRn for usage.')
 
   const summary: string = await webR.evalRString(
     R.replaceAll('__NUM__', input.numerator)
@@ -226,16 +126,134 @@ export async function runDtu(
      .replaceAll('__SHRINK__', input.shrink ?? 'none')
      .replaceAll('__FILTERNOTE__', FILTER_NOTE))
 
-  const [nTested, nDte, nDtu] = summary.split('|').map(n => parseInt(n, 10) || 0)
+  const [nTested, nDte] = summary.split('|').map(n => parseInt(n, 10) || 0)
   let notes: string[] = []
   try {
-    notes = dec.decode(await webR.FS.readFile('/work/dtu_notes.txt')).split('\n').filter(Boolean)
+    notes = dec.decode(await webR.FS.readFile('/work/dte_notes.txt')).split('\n').filter(Boolean)
   } catch { /* none */ }
   notes.forEach(onLog)
 
-  return {
-    dteCsv: dec.decode(await webR.FS.readFile('/work/dte.csv')),
-    dtuCsv: dec.decode(await webR.FS.readFile('/work/dtu.csv')),
-    nTested, nDte, nDtu, notes,
+  return { dteCsv: dec.decode(await webR.FS.readFile('/work/dte.csv')), nTested, nDte, notes }
+}
+
+// ── Reading the pipeline's DEXSeq result ────────────────────────────────────
+
+export interface DexseqTables {
+  /** `results_dtu_transcript.tsv`: featureID, groupID, log2FoldChange, pvalue, padj */
+  transcript: string[][]
+  /** `results_dtu_gene.tsv`: GENEID, qval — DEXSeq's own perGeneQValue. */
+  gene?: string[][]
+}
+
+const norm = (s: string) => (s ?? '').trim().toLowerCase().replace(/[_.]/g, '')
+const col = (h: string[], ...names: string[]) => {
+  const want = new Set(names.map(norm))
+  return h.findIndex(x => want.has(norm(x)))
+}
+const clean = (v: string | undefined) => {
+  const t = (v ?? '').trim()
+  return t === 'NA' || t === 'NaN' || t === 'null' ? '' : t
+}
+
+export interface DtuFromPipeline {
+  dtuCsv: string
+  nTested: number
+  nDtu: number
+  nGeneQ: number
+  notes: string[]
+}
+
+/**
+ * Turn the pipeline's DEXSeq tables into the bundle's `dtu_<contrast>.csv`.
+ *
+ * Every statistic here is DEXSeq's, carried through unaltered: the effect, the
+ * p-value, the FDR and the per-gene q-value. The only numbers this function
+ * computes are the two observed usage SHARES, which are not a test — they are
+ * each transcript's fraction of its gene's counts, and they exist so the studio
+ * can draw the mix without recomputing anything the test depended on.
+ */
+export function dtuFromPipeline(
+  tables: DexseqTables,
+  txCountsCsv: string,
+  samples: { sample: string; group: string }[],
+  numerator: string,
+  denominator: string,
+): DtuFromPipeline {
+  const th = tables.transcript[0].map(x => String(x ?? '').trim())
+  const iTx = col(th, 'featureID', 'transcript_id')
+  const iGene = col(th, 'groupID', 'gene_id')
+  const iLfc = col(th, 'log2FoldChange', 'log2fold')
+  const iP = col(th, 'pvalue')
+  const iQ = col(th, 'padj')
+  if (iTx < 0 || iGene < 0 || iP < 0) {
+    throw new Error(
+      'That does not look like a DEXSeq transcript table. Expected featureID, groupID and ' +
+      'pvalue columns — wf-transcriptomes writes it to ' +
+      'out/de_analysis/<contrast>/results_dtu_transcript.tsv.')
   }
+
+  // DEXSeq's own perGeneQValue, when the gene table came with it.
+  const geneQ = new Map<string, string>()
+  if (tables.gene?.length) {
+    const gh = tables.gene[0].map(x => String(x ?? '').trim())
+    const gi = col(gh, 'GENEID', 'gene_id', 'groupID')
+    const qi = col(gh, 'qval', 'padj', 'qvalue')
+    if (gi >= 0 && qi >= 0) {
+      for (const r of tables.gene.slice(1)) {
+        const g = clean(r[gi]); if (g) geneQ.set(g, clean(r[qi]))
+      }
+    }
+  }
+
+  // Observed shares, from the same matrix the bundle ships.
+  const lines = txCountsCsv.trim().split(/\r?\n/)
+  const head = lines[0].split(',').map(x => x.replace(/^"|"$/g, ''))
+  const sampleCol = new Map(head.map((h, i) => [h, i] as const))
+  const numIdx = samples.filter(s => s.group === numerator).map(s => sampleCol.get(s.sample)!)
+    .filter(i => i != null)
+  const denIdx = samples.filter(s => s.group === denominator).map(s => sampleCol.get(s.sample)!)
+    .filter(i => i != null)
+  const counts = new Map<string, number[]>()
+  for (let r = 1; r < lines.length; r++) {
+    const c = lines[r].split(',')
+    counts.set(c[0].replace(/^"|"$/g, ''), c.map(Number))
+  }
+  const geneTotal = new Map<string, number[]>()
+  const geneOf = new Map<string, string>()
+  for (const row of tables.transcript.slice(1)) {
+    const t = clean(row[iTx]), g = clean(row[iGene])
+    if (!t || !g) continue
+    geneOf.set(t, g)
+    const v = counts.get(t); if (!v) continue
+    let acc = geneTotal.get(g)
+    if (!acc) { acc = new Array(v.length).fill(0); geneTotal.set(g, acc) }
+    for (let i = 1; i < v.length; i++) acc[i] += Number.isFinite(v[i]) ? v[i] : 0
+  }
+  const share = (t: string, idx: number[]) => {
+    const v = counts.get(t), tot = geneTotal.get(geneOf.get(t) ?? '')
+    if (!v || !tot) return ''
+    const xs = idx.map(i => (tot[i] > 0 ? v[i] / tot[i] : NaN)).filter(Number.isFinite)
+    return xs.length ? (xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(6) : ''
+  }
+
+  const out = ['transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den']
+  let nDtu = 0, nTested = 0
+  for (const row of tables.transcript.slice(1)) {
+    const t = clean(row[iTx]), g = clean(row[iGene])
+    if (!t) continue
+    nTested++
+    const padj = iQ >= 0 ? clean(row[iQ]) : ''
+    if (padj && Number(padj) < 0.05) nDtu++
+    out.push([t, g, iLfc >= 0 ? clean(row[iLfc]) : '', clean(row[iP]), padj,
+      geneQ.get(g) ?? '', share(t, numIdx), share(t, denIdx)].map(csvEsc).join(','))
+  }
+
+  const notes = [
+    `DEXSeq from the pipeline: ${nTested.toLocaleString()} transcripts, ` +
+    `${nDtu.toLocaleString()} with changed usage (FDR<0.05)`,
+    geneQ.size
+      ? `per-gene q-values: ${geneQ.size.toLocaleString()} from DEXSeq's perGeneQValue`
+      : 'no results_dtu_gene.tsv supplied, so the bundle carries no per-gene q-value',
+  ]
+  return { dtuCsv: out.join('\n') + '\n', nTested, nDtu, nGeneQ: geneQ.size, notes }
 }

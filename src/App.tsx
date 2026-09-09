@@ -12,7 +12,7 @@ import {
   isTranscriptMatrix, readLongRead, applySqanti, describe as describeLongRead,
   type LongReadInput,
 } from './lib/longread'
-import { runDtu, FILTER_NOTE } from './lib/dtu'
+import { runDte, dtuFromPipeline, FILTER_NOTE, type DexseqTables } from './lib/dtu'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
   detectFactors, pairwiseContrasts, withinFactorContrasts, interactionContrast,
@@ -132,6 +132,10 @@ export default function App() {
   const [wantIsoform, setWantIsoform] = useState(true)
   const [sqantiNote, setSqantiNote] = useState<string | null>(null)
   const sqantiRef = useRef<HTMLInputElement>(null)
+  const dexseqRef = useRef<HTMLInputElement>(null)
+  /** The pipeline's own DEXSeq tables, when supplied. */
+  const [dexseq, setDexseq] = useState<DexseqTables | null>(null)
+  const [dexseqNote, setDexseqNote] = useState<string | null>(null)
 
   const onLog = (m: string) => setLog(prev => [...prev, m])
 
@@ -188,6 +192,7 @@ export default function App() {
       // raw_counts.csv came from the second, with platform: 'long-read'
       // asserting they belonged together. Nothing errored.
       setLongRead(null); setSqantiNote(null); txCountsRef.current = null
+    setDexseq(null); setDexseqNote(null)
       if (isRObjectFile(f.name)) {
         // nf-core's own object: counts, sample table and design in one file.
         const webR = await getWebR(onLog)
@@ -260,6 +265,39 @@ export default function App() {
         : `${matched.toLocaleString()} of ${total.toLocaleString()} transcripts classified.`)
     } catch (e: any) {
       setSqantiNote(String(e?.message || e))
+    }
+  }
+
+  /**
+   * The pipeline's own DEXSeq result.
+   *
+   * DTU is not computed in this app — DEXSeq cannot load in webR (see
+   * src/lib/dtu.ts) — so the usage numbers come from the run that already
+   * produced them, unaltered. Both files are accepted at once: the transcript
+   * table carries the test, the gene table carries DEXSeq's perGeneQValue.
+   */
+  async function onDexseq(files?: FileList | null) {
+    if (!files?.length) return
+    try {
+      const next: DexseqTables = { transcript: [] }
+      for (const f of Array.from(files)) {
+        const rows = Papa.parse<string[]>((await f.text()).trim(),
+          { skipEmptyLines: true, delimiter: '\t' }).data as string[][]
+        const head = (rows[0] ?? []).map(h => String(h ?? '').trim().toLowerCase())
+        if (head.includes('featureid')) next.transcript = rows
+        else if (head.includes('geneid') && head.some(h => /qval/.test(h))) next.gene = rows
+      }
+      if (!next.transcript.length) {
+        setDexseqNote('No results_dtu_transcript.tsv among those files — that is the one '
+          + 'carrying the test. Look in out/de_analysis/<contrast>/.')
+        return
+      }
+      setDexseq(next)
+      setDexseqNote(`DEXSeq table read: ${(next.transcript.length - 1).toLocaleString()} transcripts`
+        + (next.gene ? `, and ${(next.gene.length - 1).toLocaleString()} per-gene q-values.`
+          : '. No results_dtu_gene.tsv, so the bundle will carry no per-gene q-value.'))
+    } catch (e: any) {
+      setDexseqNote(String(e?.message || e))
     }
   }
 
@@ -442,11 +480,15 @@ export default function App() {
       // Built from `wantIsoform`, not merely from `longRead`. Otherwise
       // unticking the box still shipped transcripts.csv and a meta.json naming
       // a DTU engine and filter that were never applied.
+      // Built from `wantIsoform`, not merely from `longRead`. Otherwise
+      // unticking the box still shipped transcripts.csv and a meta.json naming
+      // a filter that was never applied.
       const runIsoform = !!(longRead && wantIsoform && txCountsRef.current)
       const isoform: IsoformOutput = {
         transcripts: runIsoform ? longRead!.transcripts : undefined,
         vocabulary: longRead?.vocabulary,
         byContrast: {},
+        dtuByContrast: {},
       }
       if (runIsoform && longRead && txCountsRef.current) {
         const pairs = requests.filter(c => c.kind === 'pairwise')
@@ -454,22 +496,33 @@ export default function App() {
         await installDtu(webR, onLog)
         for (const c of pairs) {
           if (c.plus.length !== 1 || c.minus.length !== 1) {
-            onLog(`Isoform layer: skipping "${c.label}" — usage is a two-group test.`)
+            onLog(`Isoform layer: skipping "${c.label}" — it is not a two-group comparison.`)
             continue
           }
           onLog(`Isoform layer: ${c.label}`)
-          const r = await runDtu(webR, {
+          const pairSamples = samples
+            .filter(x => x.group === c.plus[0] || x.group === c.minus[0])
+            .map(x => ({ sample: x.sample, group: x.group }))
+          const r = await runDte(webR, {
             txCountsCsv: txCountsRef.current,
-            txToGene: longRead.txToGene,
-            samples: samples
-              .filter(x => x.group === c.plus[0] || x.group === c.minus[0])
-              .map(x => ({ sample: x.sample, group: x.group })),
+            samples: pairSamples,
             numerator: c.plus[0], denominator: c.minus[0],
             shrink: method === 'deseq2' ? shrink : 'none',
           }, onLog)
           isoform.byContrast[c.id] = r
           onLog(`  ${r.nTested.toLocaleString()} transcripts tested · `
-            + `${r.nDte} differentially expressed · ${r.nDtu} with changed usage (FDR<0.05)`)
+            + `${r.nDte} differentially expressed (FDR<0.05)`)
+
+          // DTU is DEXSeq's, computed by the pipeline. Only the FIRST pairwise
+          // comparison gets it: one uploaded table is one contrast, and
+          // attaching it to a second pair would label another comparison's
+          // numbers with this one's name.
+          if (dexseq && c.id === pairs[0]?.id) {
+            const d = dtuFromPipeline(dexseq, txCountsRef.current, pairSamples,
+              c.plus[0], c.minus[0])
+            isoform.dtuByContrast![c.id] = d.dtuCsv
+            d.notes.forEach(onLog)
+          }
         }
       }
 
@@ -500,6 +553,7 @@ export default function App() {
     setStep('upload'); setCounts(null); setDesign(null); setResult(null)
     setZipUrl(null); setLog([]); setRunErr(null); setSaved(false); setChosen(null)
     setLongRead(null); setSqantiNote(null); txCountsRef.current = null
+    setDexseq(null); setDexseqNote(null)
   }
 
   return (
@@ -541,8 +595,7 @@ export default function App() {
               <li>· <code className="font-mono text-[12px]">*.SummarizedExperiment.rds</code></li>
               <li>· <code className="font-mono text-[12px]">cohort/transcript_counts.tsv</code> — Oxford
                 Nanopore <b>wf-transcriptomes</b>. Quantified per isoform, so the lab sums it to genes
-                <em>and</em> keeps the transcript layer: it adds isoform-level DESeq2 and a satuRn usage
-                test to the bundle. A PacBio or StringTie transcript matrix works the same way.</li>
+                <em>and</em> keeps the transcript layer: it adds isoform-level DESeq2 to the bundle. A PacBio or StringTie transcript matrix works the same way.</li>
             </ul>
             <button className="btn btn-primary" disabled={uploadBusy} onClick={() => fileRef.current?.click()}>
               {uploadBusy ? 'Reading…' : '⭱ Choose counts file or R object'}
@@ -789,9 +842,7 @@ export default function App() {
                   </label>
                   <p className="mt-1 pl-6 text-slate-600 dark:text-slate-300">
                     {describeLongRead(longRead)}. Adds transcript-level DESeq2 and a{' '}
-                    <b>satuRn</b> usage test per comparison, keeping {FILTER_NOTE}. It runs
-                    one comparison at a time. (Not DEXSeq: that imports Rsamtools, which has
-                    no WebAssembly build, so it cannot load in a browser.)
+                    transcript-level <b>DESeq2</b> per comparison, keeping {FILTER_NOTE}.
                   </p>
                   <div className="mt-2 pl-6">
                     <button className="btn btn-ghost text-xs" onClick={() => sqantiRef.current?.click()}>
@@ -805,6 +856,23 @@ export default function App() {
                       novel versus annotated, but not which kind of novel.
                     </p>
                     {sqantiNote && <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">{sqantiNote}</p>}
+                  </div>
+                  <div className="mt-3 pl-6">
+                    <button className="btn btn-ghost text-xs" onClick={() => dexseqRef.current?.click()}>
+                      ⭱ Add your pipeline’s DEXSeq result (optional)
+                    </button>
+                    <input ref={dexseqRef} type="file" accept=".tsv,.txt,.csv" multiple className="hidden"
+                      onChange={e => onDexseq(e.target.files)} />
+                    <p className="mt-1 text-xs text-slate-500">
+                      <code className="font-mono text-[11px]">out/de_analysis/&lt;contrast&gt;/results_dtu_transcript.tsv</code>
+                      {' '}and{' '}
+                      <code className="font-mono text-[11px]">results_dtu_gene.tsv</code> — pick both.
+                      Differential transcript <b>usage</b> is not computed here: DEXSeq cannot load
+                      in the browser (it needs Rsamtools, which has no WebAssembly build), and a
+                      different engine’s numbers under DEXSeq’s name would be worse than none.
+                      Supply these and the bundle carries the real thing.
+                    </p>
+                    {dexseqNote && <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">{dexseqNote}</p>}
                   </div>
                 </div>
               )}

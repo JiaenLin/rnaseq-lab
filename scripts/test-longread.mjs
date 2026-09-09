@@ -4,6 +4,7 @@ import { parseMatrix } from '../src/lib/matrix.ts'
 import {
   isTranscriptMatrix, readLongRead, applySqanti, displayName, transcriptsCsv, describe,
 } from '../src/lib/longread.ts'
+import { dtuFromPipeline } from '../src/lib/dtu.ts'
 
 let failed = 0
 const check = (name, got, want) => {
@@ -137,6 +138,49 @@ console.log('\nDEFECTS FOUND IN REVIEW, PINNED')
   const v2 = applySqanti(l2.transcripts,
     rows('isoform\tstructural_category', 'T1\tnovel_in_catalog', 'T2\tfull-splice_match'))
   check('a complete join is sqanti', v2.vocabulary, 'sqanti')
+}
+
+console.log('\nDEXSeq READ FROM THE PIPELINE, NOT RECOMPUTED')
+{
+  const tsv = (...l) => l.map(x => x.split('\t'))
+  const tables = {
+    transcript: tsv(
+      'featureID\tgroupID\tlog2FoldChange\tpvalue\tpadj\texonBaseMean',
+      'T1\tG1\t-3.2\t1e-9\t1e-8\t40',
+      'T2\tG1\t3.2\t1e-9\t1e-8\t40',
+      'T3\tG2\t0.1\t0.8\t0.95\t7'),
+    gene: tsv('GENEID\tqval', 'G1\t2e-8', 'G2\t0.95'),
+  }
+  const counts = 'transcript_id,a,b,c,d\nT1,9,10,1,2\nT2,1,2,39,42\nT3,7,7,7,7\n'
+  const smp = [
+    { sample: 'a', group: 'WT' }, { sample: 'b', group: 'WT' },
+    { sample: 'c', group: 'KO' }, { sample: 'd', group: 'KO' }]
+  const r = dtuFromPipeline(tables, counts, smp, 'KO', 'WT')
+  const rows = r.dtuCsv.trim().split('\n')
+  check('header names the effect, not a fold change of expression', rows[0],
+    'transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den')
+  check('every transcript carried through', rows.length - 1, 3)
+  // DEXSeq's numbers pass through UNALTERED — that is the whole point.
+  const t1 = rows[1].split(',').map(x => x.replace(/^"|"$/g, ''))
+  check('the effect is DEXSeq\'s', t1[2], '-3.2')
+  check('the p-value is DEXSeq\'s', t1[3], '1e-9')
+  check('the FDR is DEXSeq\'s', t1[4], '1e-8')
+  check('the per-gene q is DEXSeq perGeneQValue, not a minimum', t1[5], '2e-8')
+  // Only the observed shares are computed here, and they are not a test.
+  // T1 in WT: 9/10 and 10/12 -> mean 0.866667; in KO: 1/40 and 2/44 -> 0.035227
+  check('WT share of T1 is observed from the counts', t1[7], '0.866667')
+  check('KO share of T1 too', t1[6], '0.035227')
+  check('significant count', r.nDtu, 2)
+
+  const noGene = dtuFromPipeline({ transcript: tables.transcript }, counts, smp, 'KO', 'WT')
+  check('without the gene table there is simply no per-gene q',
+    noGene.dtuCsv.trim().split('\n')[1].split(',')[5].replace(/"/g, ''), '')
+  check('and the run says so', /no results_dtu_gene/.test(noGene.notes.join(' ')), true)
+
+  let bad = ''
+  try { dtuFromPipeline({ transcript: tsv('a\tb', '1\t2') }, counts, smp, 'KO', 'WT') }
+  catch (e) { bad = e.message }
+  check('a file that is not a DEXSeq table says so', /DEXSeq transcript table/.test(bad), true)
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll isoform-layer tests passed\n')

@@ -70,24 +70,38 @@ Three things then run instead of one:
 |---|---|
 | gene-level DESeq2 | unchanged — the same fit, the same numbers, the same `deg_*.csv` |
 | transcript-level DESeq2 | **DTE** — is this isoform present at a different level? |
-| satuRn | **DTU** — did the gene's isoform *mix* change? |
+| DEXSeq *(from your pipeline)* | **DTU** — did the gene's isoform *mix* change? |
 
-DTU is the one that needs long reads. A gene can be perfectly flat while its dominant
-isoform swaps, and no gene-level table can show that.
+**DTU is not computed here, and that is deliberate.** DEXSeq is the established tool for
+differential transcript usage and the one wf-transcriptomes itself runs — and it cannot
+load in a browser, for reasons upstream of this project:
 
-**Why satuRn and not DEXSeq.** DEXSeq is what wf-transcriptomes itself runs, so it was the
-first choice — a bundle built with it would have been directly comparable to the cluster's
-own `results_dtu_transcript.tsv`. It cannot run in a browser: DEXSeq imports `Rsamtools`,
-which wraps htslib, and **no WebAssembly build of Rsamtools exists** on either
-`repo.r-wasm.org` or `bioc.r-universe.dev`, so `library(DEXSeq)` fails at namespace load.
-Of the alternatives DRIMSeq needs only `locfit` (which this app already builds) and satuRn
-needs nothing at all; satuRn is built for exactly this scale and asks the same question.
+- DEXSeq declares `import(Rsamtools)` in its NAMESPACE, so `library(DEXSeq)` needs
+  Rsamtools present. It never *uses* it: not one Rsamtools symbol appears in any of its
+  eight R files.
+- Rsamtools has no WebAssembly build anywhere — `repo.r-wasm.org` and three r-universes, at
+  R 4.4, 4.5 and 4.6.
+- Building it fails at the link step, not for a reason this repo can fix: Rsamtools links
+  against Rhtslib, and the Rhtslib wasm build ships a `libhts.a` whose members are **host**
+  objects (`wasm-ld: archive member 'hts.o' is neither Wasm object file nor LLVM bitcode`,
+  for every member). htslib is not actually cross-compiled for Emscripten.
+- DEXSeq also reaches `XML` via `geneplotter → annotate`, and XML's configure fails its
+  libxml2 link test under emscripten too.
 
-The cost is recorded in the bundle rather than glossed: satuRn's effect is a change in the
-**log odds** of an isoform's usage, not a log2 fold change, and its numbers are not
-arithmetically comparable to DEXSeq's. `meta.json` names both the engine and the scale.
-The filter is unchanged — at least 10 counts in total and at least 3 counts in at least 2
-samples.
+Substituting a different engine and reporting its numbers under DTU's name would be worse
+than reporting none. So instead, **upload the DEXSeq result your pipeline already
+computed** and the bundle carries the real thing:
+
+| From the pipeline | What it carries |
+|---|---|
+| `out/de_analysis/<contrast>/results_dtu_transcript.tsv` | the test — effect, p-value, FDR |
+| `out/de_analysis/<contrast>/results_dtu_gene.tsv` | DEXSeq's own `perGeneQValue` |
+
+Every statistic passes through unaltered. The only numbers computed here are the two
+observed usage **shares** — each transcript's fraction of its gene's counts — which are not
+a test, and exist so the studio can draw the mix without recomputing anything the test
+depended on. With no such file the bundle simply carries no DTU; the studio degrades to the
+gene and transcript layers.
 
 **Names, not accessions.** `Nppb-201` for an annotated model; `Nppb-novel-1` for a novel
 isoform of a known gene, numbered by position within the gene so it is stable across
