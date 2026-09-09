@@ -1,5 +1,21 @@
 import { zipSync } from 'fflate'
 import type { AnalysisInput, AnalysisResult, Method } from './webr'
+import type { DtuResult } from './dtu'
+import { transcriptsCsv, type TranscriptAnn, type CategoryVocabulary } from './longread.ts'
+
+/**
+ * The isoform layer, as the run produced it.
+ *
+ * Every field optional at the bundle level: a bundle without one is schema v1
+ * and opens unchanged in a studio that has never heard of transcripts.
+ */
+export interface IsoformOutput {
+  transcripts?: readonly TranscriptAnn[]
+  /** Which vocabulary `structural_category` speaks. See longread.ts. */
+  vocabulary?: CategoryVocabulary
+  /** contrast id -> the DTE and DTU tables for that pair. */
+  byContrast: Record<string, DtuResult>
+}
 
 export interface BundleParams {
   project: string
@@ -20,6 +36,16 @@ export interface BundleParams {
   blockFactor?: string
   /** gene_id -> symbol, when the source carried both */
   geneNames?: Map<string, string>
+  /**
+   * The transcript layer. Adds files; changes none.
+   *
+   * Written only when the upload was a transcript matrix. `platform` in
+   * meta.json is what a reader keys off — its absence is the schema-v1 signal,
+   * so nothing has to sniff for the files.
+   */
+  isoform?: IsoformOutput
+  /** The transcript matrix exactly as uploaded, for `transcript_counts.csv`. */
+  transcriptCountsCsv?: string
   countsUnitNote?: string
   /**
    * The group every reference level points at — see `referenceGroup`.
@@ -154,8 +180,17 @@ export function buildBundleFiles(
     || ordered.find(c => c.kind === 'pairwise')?.denominator
     || input.groupLevels[0]
 
+  const isoform = params.isoform?.transcripts ? params.isoform : undefined
   const meta = {
-    schema: 1,
+    /**
+     * 2 exactly when the transcript layer is present.
+     *
+     * A reader gating on `schema >= 2` was being handed a bundle that said 1
+     * and carried v2 files; one gating on the presence of `platform` was being
+     * handed `'short-read'` on every gene-level bundle, which is not a v1
+     * signal at all. One field, one meaning: v1 bundles carry neither.
+     */
+    schema: isoform ? 2 : 1,
     project: params.project || 'RNA-seq analysis',
     species: params.species || 'unknown',
     created: new Date().toISOString().slice(0, 10),
@@ -190,6 +225,39 @@ export function buildBundleFiles(
      */
     shrinkage: params.shrink ?? 'none',
     n_samples: input.samples.length,
+    /**
+     * Schema v2. Absent on every gene-level bundle, which is how a reader tells
+     * the two apart without opening a single file.
+     */
+    ...(isoform ? { platform: 'long-read' } : {}),
+    transcript_layer: isoform ? {
+      annotation: 'transcripts.csv',
+      counts: 'transcript_counts.csv',
+      n_transcripts: isoform.transcripts!.length,
+      n_novel: isoform.transcripts!.filter(t => t.novel).length,
+      dte_files: Object.fromEntries(
+        Object.keys(isoform.byContrast).map(id => [id, `dte_${id}.csv`])),
+      dtu_files: Object.fromEntries(
+        Object.keys(isoform.byContrast).map(id => [id, `dtu_${id}.csv`])),
+      /**
+       * Which vocabulary `structural_category` in transcripts.csv speaks —
+       * bambu's own class strings, SQANTI3's categories, or a partial join that
+       * is both. Without it a reader colouring by FSM/NIC/NNC silently maps
+       * every bambu class to "unknown".
+       */
+      category_vocabulary: isoform.vocabulary ?? 'none',
+      /**
+       * DTE is fitted per PAIR, on that pair's samples only; the gene-level DEG
+       * comes from one fit over every sample. Dispersions, size factors and
+       * independent filtering therefore differ, so a transcript's DTE numbers
+       * do not reconcile arithmetically with its gene's DEG numbers. Stated
+       * here because nothing else in the bundle says so.
+       */
+      dte_fit: 'per-contrast, on that contrast\'s samples only',
+      /** DTU engine, named because a satuRn bundle would not be comparable. */
+      dtu_engine: 'DEXSeq',
+      dtu_filter: 'total counts >= 10 and >= 3 counts in >= 2 samples',
+    } : null,
     contrasts: ordered.map(c => ({
       id: c.id,
       numerator: c.numerator,
@@ -239,6 +307,20 @@ export function buildBundleFiles(
   for (const c of ordered) {
     files[`deg_${c.id}.csv`] = enc.encode(
       params.geneNames ? reshapeDeg(c.degCsv, params.geneNames) : c.degCsv)
+  }
+
+  // The transcript layer. `transcript_counts.csv` is the matrix AS UPLOADED —
+  // the gene matrix was summed from it, so the studio can always reconcile the
+  // two, and the DTU test was run on exactly these numbers.
+  if (isoform?.transcripts) {
+    files['transcripts.csv'] = enc.encode(transcriptsCsv(isoform.transcripts))
+    if (params.transcriptCountsCsv) {
+      files['transcript_counts.csv'] = enc.encode(params.transcriptCountsCsv)
+    }
+    for (const [id, r] of Object.entries(isoform.byContrast)) {
+      files[`dte_${id}.csv`] = enc.encode(r.dteCsv)
+      files[`dtu_${id}.csv`] = enc.encode(r.dtuCsv)
+    }
   }
   return files
 }

@@ -179,6 +179,16 @@ export const packagesFor = (method: Method, shrink: Shrink): string[] =>
   method === 'limma' ? ['limma']
     : shrink === 'apeglm' ? ['DESeq2', 'apeglm'] : ['DESeq2']
 
+/**
+ * DESeq2 + DEXSeq, for the isoform layer.
+ *
+ * DEXSeq comes from bioc.r-universe.dev, which is already in the repo list; it
+ * is a large install and the first run pays for it once, like DESeq2 does.
+ */
+export const installDtu = (webR: any, onLog: (m: string) => void) =>
+  install(webR, 'dtu', ['DESeq2', 'DEXSeq'], onLog,
+    'Installing DESeq2 and DEXSeq for the isoform layer… (first run downloads tens of MB, then cached)')
+
 export const installFor = (webR: any, method: Method, shrink: Shrink) =>
   webR.installPackages(packagesFor(method, shrink), {
     repos: [LOCFIT_REPO, 'https://bioc.r-universe.dev', 'https://repo.r-wasm.org'],

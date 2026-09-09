@@ -43,9 +43,47 @@ The DE run is the mechanism, not a second product.
 | `salmon.merged.gene_counts.tsv` | nf-core's matrix. Its `gene_id` **and** `gene_name` columns are recognised as annotation — the naive "column 0 is the gene, the rest are samples" rule turns `gene_name` into a 20th sample full of gene symbols |
 | `deseq2.dds.RData` | nf-core's DESeq2 object: counts **and** the sample table **and** the design, so nothing has to be guessed from sample names |
 | `*.SummarizedExperiment.rds` | gene- or transcript-level |
+| `cohort/transcript_counts.tsv` | **Oxford Nanopore wf-transcriptomes.** Quantified per isoform. Its 13 leading annotation columns — five of them numeric (`NDR`, `readCount`, `relReadCount`, `relSubsetCount`, `eqClassById`) — are recognised as annotation, not as five extra samples |
+| `cohort/sqanti/cohort_classification.txt` | optional, added on the Run step. SQANTI3's structural category per isoform |
 
 R objects are opened by R itself, in webR — the same engine that runs the DE. No JavaScript
 RData parser is involved.
+
+## Long reads: the isoform layer
+
+Upload a **transcript-level** matrix and the lab reads two layers out of one file.
+
+| From the pipeline | Where |
+|---|---|
+| `out/cohort/transcript_counts.tsv` | **required** — the counts, and the isoform annotation beside them |
+| `out/cohort/sqanti/cohort_classification.txt` | optional — FSM / ISM / NIC / NNC per isoform |
+
+The gene matrix is **summed from the transcript matrix**, not read from
+`gene_counts.tsv` beside it. bambu writes those two independently, and a DTU result that
+disagreed with the gene-level fold change next to it would leave nobody able to say which
+was right. One file, one derivation. Counts are rounded once, at the transcript level, so
+the gene totals are sums of exactly the integers the isoform tests were handed.
+
+Three things then run instead of one:
+
+| | |
+|---|---|
+| gene-level DESeq2 | unchanged — the same fit, the same numbers, the same `deg_*.csv` |
+| transcript-level DESeq2 | **DTE** — is this isoform present at a different level? |
+| DEXSeq | **DTU** — did the gene's isoform *mix* change? |
+
+DTU is the one that needs long reads. A gene can be perfectly flat while its dominant
+isoform swaps, and no gene-level table can show that. DEXSeq is used because it is what
+wf-transcriptomes itself runs, so a bundle built here is comparable to the cluster's own
+`results_dtu_transcript.tsv` rather than merely similar to it. It is the slow half of the
+run and tests one comparison at a time, keeping transcripts with at least 10 counts in
+total and at least 3 counts in at least 2 samples.
+
+**Names, not accessions.** `Nppb-201` for an annotated model; `Nppb-novel-1` for a novel
+isoform of a known gene, numbered by position within the gene so it is stable across
+rebuilds; the accession when there is nothing better. Nothing is merged — two models may
+land on the same display name and both keep their own row — and the accession is never
+lost, so `ENSMUST00000103231` typed into the studio's search still finds it.
 
 ## Designs it understands
 

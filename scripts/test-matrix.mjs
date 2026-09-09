@@ -31,6 +31,34 @@ console.log('\nTELLING ANNOTATION COLUMNS FROM SAMPLES')
   check('gene count', m.nGenes, 2)
 }
 {
+  // The exact header of wf-transcriptomes `cohort/transcript_counts.tsv`.
+  // Thirteen annotation columns, five of them numeric. Before the long-read
+  // vocabulary was added to ANNOTATION_RX this cohort read as ELEVEN samples:
+  // NDR, readCount, relReadCount, relSubsetCount and eqClassById all passed the
+  // numeric test, and the design was then built from transcript metadata.
+  const m = parseMatrix(rows(
+    'TXNAME,GENEID,NDR,novelGene,novelTranscript,txClassDescription,readCount,relReadCount,relSubsetCount,txid,eqClassById,gene_name,transcript_name,A24M_4,A24M_5,A24M_6,WT_1,WT_2,WT_3',
+    'BambuTx1,ENSMUSG00000018845,0.0063,FALSE,TRUE,newWithin,41,0.745,1,1,1,Unc45b,NA,36.69,20.83,52.38,33,10.9,9.28',
+    'ENSMUST00000103231,ENSMUSG00000029019,NA,FALSE,FALSE,annotation,900,1,1,2,2,Nppb,Nppb-201,180,150,210,44,51,39',
+  ))
+  check('wf-transcriptomes transcript matrix -> 6 samples, not 11',
+    m.samples, ['A24M_4', 'A24M_5', 'A24M_6', 'WT_1', 'WT_2', 'WT_3'])
+  check('TXNAME kept as the key', m.geneIds, ['BambuTx1', 'ENSMUST00000103231'])
+  check('gene_name kept as the symbol', m.geneNames, ['Unc45b', 'Nppb'])
+  check('every metadata column set aside', m.annotationColumns.length, 13)
+}
+{
+  // A bambu gene matrix. `newGeneClass` is text and was always safe; this
+  // pins it so a future ANNOTATION_RX edit cannot quietly reclassify it.
+  const m = parseMatrix(rows(
+    'GENEID,newGeneClass,gene_name,A24M_4,WT_1',
+    'BambuGene103,newGene-spliced,NA,3,0',
+    'ENSMUSG00000064339,annotation,mt-Rnr2,900000,1200000',
+  ))
+  check('bambu gene matrix -> 2 samples', m.samples, ['A24M_4', 'WT_1'])
+  check('GENEID kept as the key', m.geneIds, ['BambuGene103', 'ENSMUSG00000064339'])
+}
+{
   // The simple shape: one gene column, no symbols.
   const m = parseMatrix(rows('gene,WT_1,WT_2,KO_1,KO_2', 'Actb,10,12,20,22', 'Gapdh,5,6,7,8'))
   check('single id column', m.samples, ['WT_1', 'WT_2', 'KO_1', 'KO_2'])

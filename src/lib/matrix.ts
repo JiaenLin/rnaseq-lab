@@ -46,9 +46,26 @@ export interface Probe {
 /** Rows kept for the probe. 2,000 x 275 is 4 MB and plenty to compare levels. */
 const PROBE_ROWS = 2000
 
-/** Column names that are annotation even if they somehow parse as numeric. */
+/**
+ * Column names that are annotation even if they somehow parse as numeric.
+ *
+ * The second line is the long-read vocabulary, and it is not cosmetic. A
+ * wf-transcriptomes `cohort/transcript_counts.tsv` carries THIRTEEN leading
+ * annotation columns, five of which are numeric:
+ *
+ *     TXNAME  GENEID  NDR  novelGene  novelTranscript  txClassDescription
+ *     readCount  relReadCount  relSubsetCount  txid  eqClassById
+ *     gene_name  transcript_name   <then the samples>
+ *
+ * `novelGene`/`novelTranscript`/`txClassDescription` announce themselves as text
+ * and are set aside by the numeric test. `NDR`, `readCount`, `relReadCount`,
+ * `relSubsetCount` and `eqClassById` do not: on this cohort's six-library matrix
+ * they were read as five extra samples, and the design was then built from
+ * eleven. Nothing errored, at any layer — the same failure mode `gene_name`
+ * already had, one file format later.
+ */
 const ANNOTATION_RX =
-  /^(gene[_.]?id|gene[_.]?name|gene[_.]?symbol|symbol|name|transcript[_.]?id|tx[_.]?id|id|entrez([_.]?(gene|id))?|ensembl([_.]?id)?|refseq|description|biotype|gene[_.]?biotype|chr|chromosome|start|end|strand|length|gene[_.]?length|width|locus)$/i
+  /^(gene[_.]?id|gene[_.]?name|gene[_.]?symbol|symbol|name|transcript[_.]?id|tx[_.]?id|id|entrez([_.]?(gene|id))?|ensembl([_.]?id)?|refseq|description|biotype|gene[_.]?biotype|chr|chromosome|start|end|strand|length|gene[_.]?length|width|locus|txname|tx[_.]?name|transcript[_.]?name|ndr|novel[_.]?gene|novel[_.]?transcript|tx[_.]?class[_.]?description|read[_.]?count|rel[_.]?read[_.]?count|rel[_.]?subset[_.]?count|eq[_.]?class[_.]?by[_.]?id|structural[_.]?category|associated[_.]?gene|associated[_.]?transcript|n[_.]?exons|exons|coding|orf[_.]?length|cds[_.]?(start|end|length)|predicted[_.]?nmd|display[_.]?name)$/i
 
 /** A gene symbol column is the one we want to keep as `gene_name`. */
 const SYMBOL_RX = /^(gene[_.]?name|gene[_.]?symbol|symbol|name)$/i

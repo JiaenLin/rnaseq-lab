@@ -1,11 +1,18 @@
 import { useMemo, useRef, useState } from 'react'
 import Papa from 'papaparse'
 import {
-  runAnalysis, getWebR, ensureObjectPackages,
+  runAnalysis, getWebR, ensureObjectPackages, installDtu,
   type AnalysisResult, type Method, type ContrastRequest,
 } from './lib/webr'
-import { buildBundleFiles, referenceGroup, referenceGroupFor, zipBundle } from './lib/bundle'
+import {
+  buildBundleFiles, referenceGroup, referenceGroupFor, zipBundle, type IsoformOutput,
+} from './lib/bundle'
 import { parseMatrix, probeFromCsv, type Probe } from './lib/matrix'
+import {
+  isTranscriptMatrix, readLongRead, applySqanti, describe as describeLongRead,
+  type LongReadInput,
+} from './lib/longread'
+import { runDtu, FILTER_NOTE } from './lib/dtu'
 import { readRObject, isRObjectFile } from './lib/robj'
 import {
   detectFactors, pairwiseContrasts, withinFactorContrasts, interactionContrast,
@@ -67,6 +74,8 @@ export default function App() {
   const [uploadErr, setUploadErr] = useState<string | null>(null)
   const [uploadBusy, setUploadBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  /** Transcript counts exactly as uploaded. DEXSeq models these, not the gene sums. */
+  const txCountsRef = useRef<string | null>(null)
 
   // design
   const [design, setDesign] = useState<Design | null>(null)
@@ -118,6 +127,11 @@ export default function App() {
   const [zipUrl, setZipUrl] = useState<string | null>(null)
   const [runErr, setRunErr] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  /** The isoform layer, when the uploaded matrix was transcript-level. */
+  const [longRead, setLongRead] = useState<LongReadInput | null>(null)
+  const [wantIsoform, setWantIsoform] = useState(true)
+  const [sqantiNote, setSqantiNote] = useState<string | null>(null)
+  const sqantiRef = useRef<HTMLInputElement>(null)
 
   const onLog = (m: string) => setLog(prev => [...prev, m])
 
@@ -167,6 +181,13 @@ export default function App() {
     if (!f) return
     setUploadErr(null); setUploadBusy(true); setLog([])
     try {
+      // EVERY upload path clears the isoform layer first. The R-object branch
+      // used to leave a previous transcript upload's layer in place: uploading
+      // transcript_counts.tsv and then an .rds shipped a bundle whose
+      // transcripts.csv and dtu_*.csv came from the first file and whose
+      // raw_counts.csv came from the second, with platform: 'long-read'
+      // asserting they belonged together. Nothing errored.
+      setLongRead(null); setSqantiNote(null); txCountsRef.current = null
       if (isRObjectFile(f.name)) {
         // nf-core's own object: counts, sample table and design in one file.
         const webR = await getWebR(onLog)
@@ -182,23 +203,63 @@ export default function App() {
       } else {
         const text = await f.text()
         const parsed = Papa.parse<string[]>(text.trim(), { skipEmptyLines: true })
-        const m = parseMatrix(parsed.data as string[][])
+        const rows = parsed.data as string[][]
+        const m = parseMatrix(rows)
+        // A transcript matrix is quantified per ISOFORM. The gene layer is
+        // summed from it here so both levels come from one file — see
+        // lib/longread.ts. Everything downstream then behaves as before.
+        const lr = isTranscriptMatrix(rows[0].map(h => String(h ?? '').trim()))
+          ? readLongRead(m, rows) : null
+        setLongRead(lr)
+        if (lr) onLog(`Isoform layer: ${describeLongRead(lr)}`)
         setCounts({
-          countsCsv: m.countsCsv, samples: m.samples, nGenes: m.nGenes,
-          geneNames: m.geneNames ? new Map(m.geneIds.map((id, i) => [id, m.geneNames![i]])) : null,
-          origin: m.annotationColumns.length > 1
-            ? `matrix (${m.annotationColumns.join(' + ')} read as annotation)`
-            : 'matrix',
+          countsCsv: lr ? lr.geneCountsCsv : m.countsCsv,
+          samples: m.samples, nGenes: lr ? lr.nGenes : m.nGenes,
+          geneNames: lr ? lr.geneNames
+            : m.geneNames ? new Map(m.geneIds.map((id, i) => [id, m.geneNames![i]])) : null,
+          origin: lr
+            ? `transcript matrix (${lr.transcripts.length.toLocaleString()} isoforms, summed to ${lr.nGenes.toLocaleString()} genes)`
+            : m.annotationColumns.length > 1
+              ? `matrix (${m.annotationColumns.join(' + ')} read as annotation)`
+              : 'matrix',
           colData: {}, colDataColumns: [],
-          probe: m.probe,
+          probe: lr ? probeFromCsv(lr.geneCountsCsv) : m.probe,
         })
-        seedDesign(m.samples, {}, [], m.probe)
+        seedDesign(m.samples, {}, [], lr ? probeFromCsv(lr.geneCountsCsv) : m.probe)
+        // The transcript counts are kept as read; the DTU engine needs them raw.
+        // The ROUNDED, transcript-keyed matrix — not parsed.countsCsv, which is
+        // headed `gene_id` and still fractional.
+        txCountsRef.current = lr ? lr.txCountsCsv : null
       }
       setStep('design')
     } catch (e: any) {
       setUploadErr(String(e?.message || e))
     } finally {
       setUploadBusy(false)
+    }
+  }
+
+  /**
+   * The optional SQANTI3 classification, joined onto transcripts already read.
+   *
+   * Separate from the counts upload because it is a separate file from the
+   * pipeline: out/cohort/sqanti/cohort_classification.txt. Without it every
+   * isoform is "annotated or not"; with it they carry FSM / ISM / NIC / NNC,
+   * which is the vocabulary the studio colours by.
+   */
+  async function onSqanti(f?: File) {
+    if (!f || !longRead) return
+    try {
+      const text = await f.text()
+      const parsed = Papa.parse<string[]>(text.trim(), { skipEmptyLines: true, delimiter: '\t' })
+      const { matched, total, vocabulary } = applySqanti(
+        longRead.transcripts, parsed.data as string[][])
+      setLongRead({ ...longRead, vocabulary })
+      setSqantiNote(matched === 0
+        ? `No transcript in that file matches this matrix — it is probably from a different run.`
+        : `${matched.toLocaleString()} of ${total.toLocaleString()} transcripts classified.`)
+    } catch (e: any) {
+      setSqantiNote(String(e?.message || e))
     }
   }
 
@@ -373,6 +434,45 @@ export default function App() {
         shrink: method === 'deseq2' ? shrink : 'none',
       }
       const res = await runAnalysis(input, onLog)
+
+      // The isoform layer, after the gene fit and never instead of it. One
+      // DTE+DTU run per PAIRWISE contrast: DEXSeq's design is a two-level
+      // usage test, so an interaction coefficient has no DTU counterpart and
+      // is skipped rather than approximated.
+      // Built from `wantIsoform`, not merely from `longRead`. Otherwise
+      // unticking the box still shipped transcripts.csv and a meta.json naming
+      // a DTU engine and filter that were never applied.
+      const runIsoform = !!(longRead && wantIsoform && txCountsRef.current)
+      const isoform: IsoformOutput = {
+        transcripts: runIsoform ? longRead!.transcripts : undefined,
+        vocabulary: longRead?.vocabulary,
+        byContrast: {},
+      }
+      if (runIsoform && longRead && txCountsRef.current) {
+        const pairs = requests.filter(c => c.kind === 'pairwise')
+        const webR = await getWebR(onLog)
+        await installDtu(webR, onLog)
+        for (const c of pairs) {
+          if (c.plus.length !== 1 || c.minus.length !== 1) {
+            onLog(`Isoform layer: skipping "${c.label}" — usage is a two-group test.`)
+            continue
+          }
+          onLog(`Isoform layer: ${c.label}`)
+          const r = await runDtu(webR, {
+            txCountsCsv: txCountsRef.current,
+            txToGene: longRead.txToGene,
+            samples: samples
+              .filter(x => x.group === c.plus[0] || x.group === c.minus[0])
+              .map(x => ({ sample: x.sample, group: x.group })),
+            numerator: c.plus[0], denominator: c.minus[0],
+            shrink: method === 'deseq2' ? shrink : 'none',
+          }, onLog)
+          isoform.byContrast[c.id] = r
+          onLog(`  ${r.nTested.toLocaleString()} transcripts tested · `
+            + `${r.nDte} differentially expressed · ${r.nDtu} with changed usage (FDR<0.05)`)
+        }
+      }
+
       const files = buildBundleFiles(input, res, {
         project, species, method, covariates,
         shrink: method === 'deseq2' ? shrink : 'none',
@@ -381,6 +481,8 @@ export default function App() {
         // contrasts — see referenceGroup.
         control: referenceGroup({ factors: named.factors, groupLevels }, refs),
         geneNames: counts.geneNames ?? undefined,
+        isoform: isoform.transcripts ? isoform : undefined,
+        transcriptCountsCsv: txCountsRef.current ?? undefined,
       })
       const blob = new Blob([zipBundle(files) as BlobPart], { type: 'application/zip' })
       setZipUrl(URL.createObjectURL(blob))
@@ -397,6 +499,7 @@ export default function App() {
   const reset = () => {
     setStep('upload'); setCounts(null); setDesign(null); setResult(null)
     setZipUrl(null); setLog([]); setRunErr(null); setSaved(false); setChosen(null)
+    setLongRead(null); setSqantiNote(null); txCountsRef.current = null
   }
 
   return (
@@ -436,6 +539,10 @@ export default function App() {
                 DESeq2 object. Carries the counts <em>and</em> the sample table, so the design does not
                 have to be guessed from sample names.</li>
               <li>· <code className="font-mono text-[12px]">*.SummarizedExperiment.rds</code></li>
+              <li>· <code className="font-mono text-[12px]">cohort/transcript_counts.tsv</code> — Oxford
+                Nanopore <b>wf-transcriptomes</b>. Quantified per isoform, so the lab sums it to genes
+                <em>and</em> keeps the transcript layer: it adds isoform-level DESeq2 and a DEXSeq usage
+                test to the bundle. A PacBio or StringTie transcript matrix works the same way.</li>
             </ul>
             <button className="btn btn-primary" disabled={uploadBusy} onClick={() => fileRef.current?.click()}>
               {uploadBusy ? 'Reading…' : '⭱ Choose counts file or R object'}
@@ -673,6 +780,33 @@ export default function App() {
               <p className="mb-3 text-sm text-slate-500">
                 {selected.length} comparison{selected.length === 1 ? '' : 's'} from one model fit.
               </p>
+              {longRead && (
+                <div className="mb-4 rounded-lg border border-emerald-300/60 bg-emerald-50/60 p-3 text-[13px] dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                  <label className="flex items-start gap-2 font-medium">
+                    <input type="checkbox" className="mt-1" checked={wantIsoform}
+                      onChange={e => setWantIsoform(e.target.checked)} />
+                    <span>Also run the isoform layer</span>
+                  </label>
+                  <p className="mt-1 pl-6 text-slate-600 dark:text-slate-300">
+                    {describeLongRead(longRead)}. Adds transcript-level DESeq2 and a{' '}
+                    <b>DEXSeq</b> usage test per comparison, keeping {FILTER_NOTE}. DEXSeq is the
+                    slow half and runs one comparison at a time.
+                  </p>
+                  <div className="mt-2 pl-6">
+                    <button className="btn btn-ghost text-xs" onClick={() => sqantiRef.current?.click()}>
+                      ⭱ Add SQANTI3 categories (optional)
+                    </button>
+                    <input ref={sqantiRef} type="file" accept=".txt,.tsv,.csv" className="hidden"
+                      onChange={e => onSqanti(e.target.files?.[0])} />
+                    <p className="mt-1 text-xs text-slate-500">
+                      <code className="font-mono text-[11px]">cohort/sqanti/cohort_classification.txt</code>{' '}
+                      — labels each isoform FSM / ISM / NIC / NNC. Without it the studio can still show
+                      novel versus annotated, but not which kind of novel.
+                    </p>
+                    {sqantiNote && <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">{sqantiNote}</p>}
+                  </div>
+                </div>
+              )}
               <div className="grid gap-3 sm:grid-cols-3">
                 <label className="text-sm">Method
                   <select className="input mt-1 w-full" value={method} onChange={e => setMethod(e.target.value as Method)}>
