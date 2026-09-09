@@ -161,6 +161,8 @@ export interface DtuFromPipeline {
   nDtu: number
   nGeneQ: number
   notes: string[]
+  /** True when the uploaded table was for the opposite contrast and was negated. */
+  flipped: boolean
 }
 
 /**
@@ -236,7 +238,8 @@ export function dtuFromPipeline(
     return xs.length ? (xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(6) : ''
   }
 
-  const out = ['transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den']
+  interface Row { t: string; g: string; e: string; p: string; q: string; un: string; ud: string }
+  const rows: Row[] = []
   let nDtu = 0, nTested = 0
   for (const row of tables.transcript.slice(1)) {
     const t = clean(row[iTx]), g = clean(row[iGene])
@@ -244,8 +247,50 @@ export function dtuFromPipeline(
     nTested++
     const padj = iQ >= 0 ? clean(row[iQ]) : ''
     if (padj && Number(padj) < 0.05) nDtu++
-    out.push([t, g, iLfc >= 0 ? clean(row[iLfc]) : '', clean(row[iP]), padj,
-      geneQ.get(g) ?? '', share(t, numIdx), share(t, denIdx)].map(csvEsc).join(','))
+    rows.push({
+      t, g,
+      e: iLfc >= 0 ? clean(row[iLfc]) : '',
+      p: clean(row[iP]), q: padj,
+      un: share(t, numIdx), ud: share(t, denIdx),
+    })
+  }
+
+  /**
+   * WHICH DIRECTION IS THE UPLOADED TABLE?
+   *
+   * A DEXSeq table says nothing about its own contrast — the columns are
+   * `featureID, groupID, log2FoldChange, …` and the direction lives only in the
+   * directory name the file came out of. So a table computed for A24M-vs-WT can
+   * be attached to a WT-vs-A24M comparison, and every effect then carries the
+   * wrong sign under a label that says otherwise. Measured on this cohort:
+   * 16,602 transcripts disagreed with the observed share change and 307 agreed.
+   *
+   * The observed shares settle it, because they are computed HERE from the
+   * counts and cannot be the wrong way round: if usage rose in the numerator,
+   * `mean_usage_num > mean_usage_den`. Rows with a tiny effect or a tiny share
+   * change carry no information about direction and are excluded.
+   *
+   * p-values and FDRs are direction-free and are never touched.
+   */
+  let agree = 0, disagree = 0
+  for (const r of rows) {
+    const e = Number(r.e), un = Number(r.un), ud = Number(r.ud)
+    if (!Number.isFinite(e) || !Number.isFinite(un) || !Number.isFinite(ud)) continue
+    if (Math.abs(e) < 0.5 || Math.abs(un - ud) < 0.02) continue
+    if ((e > 0) === (un > ud)) agree++; else disagree++
+  }
+  const informative = agree + disagree
+  const flip = informative >= 20 && disagree > agree * 4
+  const ambiguous = informative >= 20 && !flip && agree <= disagree * 4
+
+  const out = ['transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den']
+  for (const r of rows) {
+    let e = r.e
+    if (flip && e !== '') {
+      const v = Number(e)
+      e = Number.isFinite(v) ? String(v === 0 ? 0 : -v) : e
+    }
+    out.push([r.t, r.g, e, r.p, r.q, geneQ.get(r.g) ?? '', r.un, r.ud].map(csvEsc).join(','))
   }
 
   const notes = [
@@ -255,6 +300,20 @@ export function dtuFromPipeline(
       ? `per-gene q-values: ${geneQ.size.toLocaleString()} from DEXSeq's perGeneQValue`
       : 'no results_dtu_gene.tsv supplied, so the bundle carries no per-gene q-value',
   ]
+
+  if (flip) {
+    notes.push(
+      `The uploaded table is for the OPPOSITE direction: ${disagree.toLocaleString()} of ` +
+      `${informative.toLocaleString()} informative transcripts had an effect whose sign ` +
+      `contradicted their observed usage change. Every effect has been negated so it reads ` +
+      `as this comparison. p-values and FDRs are direction-free and are unchanged.`)
+  } else if (ambiguous) {
+    notes.push(
+      `WARNING: the effect signs do not consistently match the observed usage changes ` +
+      `(${agree.toLocaleString()} agree, ${disagree.toLocaleString()} disagree). The table ` +
+      `may not correspond to this comparison. Effects are carried through as supplied; ` +
+      `read the shares, which come from your counts.`)
+  }
 
   /**
    * The shares are computed from the UPLOADED matrix; DEXSeq ran on the
@@ -270,13 +329,6 @@ export function dtuFromPipeline(
       `table are not in the counts matrix, so they carry no usage share. The statistics are ` +
       `unaffected; the shares are drawn from the matrix you uploaded.`)
   }
-  const singleton = [...geneTotal.keys()].filter(g =>
-    [...geneOf.values()].filter(x => x === g).length === 1).length
-  if (singleton) {
-    notes.push(
-      `${singleton.toLocaleString()} gene(s) have a single isoform in the uploaded matrix, so ` +
-      `their shares are 100% in both groups. If DEXSeq tested them, it saw more isoforms than ` +
-      `this matrix has — check that the counts and the DEXSeq table come from the same run.`)
-  }
-  return { dtuCsv: out.join('\n') + '\n', nTested, nDtu, nGeneQ: geneQ.size, notes }
+
+  return { dtuCsv: out.join('\n') + '\n', nTested, nDtu, nGeneQ: geneQ.size, notes, flipped: flip }
 }

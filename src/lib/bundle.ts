@@ -23,6 +23,8 @@ export interface IsoformOutput {
    * A bundle can have the first without the second.
    */
   dtuByContrast?: Record<string, string>
+  /** Contrast ids whose uploaded DEXSeq table was for the opposite direction. */
+  dtuFlipped?: string[]
 }
 
 export interface BundleParams {
@@ -274,6 +276,18 @@ export function buildBundleFiles(
         dtu_engine: 'DEXSeq (computed by the pipeline, read here unaltered)',
         dtu_effect_scale: 'log2 fold change of isoform usage',
         dtu_gene_padj: "DEXSeq perGeneQValue, from the pipeline's results_dtu_gene.tsv",
+        /**
+         * A DEXSeq table carries no record of its own contrast direction, so an
+         * A-vs-B table can be attached to a B-vs-A comparison. When the effect
+         * signs contradicted the observed usage changes the effects were
+         * negated to match this bundle's contrast; p-values and FDRs are
+         * direction-free and were untouched. Recorded because a reader
+         * comparing this file to the pipeline's own will otherwise find every
+         * sign reversed and have no way to know why.
+         */
+        ...(params.isoform?.dtuFlipped?.length
+          ? { dtu_effect_negated_for: params.isoform.dtuFlipped }
+          : {}),
       } : {}),
       dtu_filter: 'total counts >= 10 and >= 3 counts in >= 2 samples',
     } : null,

@@ -521,6 +521,7 @@ export default function App() {
             const d = dtuFromPipeline(dexseq, txCountsRef.current, pairSamples,
               c.plus[0], c.minus[0])
             isoform.dtuByContrast![c.id] = d.dtuCsv
+            if (d.flipped) (isoform.dtuFlipped ??= []).push(c.id)
             d.notes.forEach(onLog)
           }
         }

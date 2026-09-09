@@ -182,6 +182,44 @@ console.log('\nDEXSeq READ FROM THE PIPELINE, NOT RECOMPUTED')
   catch (e) { bad = e.message }
   check('a file that is not a DEXSeq table says so', /DEXSeq transcript table/.test(bad), true)
 }
+{
+  // A DEXSeq table records no contrast of its own — the direction lives only in
+  // the directory it came out of. Attaching an A-vs-B table to a B-vs-A
+  // comparison inverts every effect under a label that says otherwise. Seen on
+  // the real cohort: 16,602 transcripts disagreed with their own share change
+  // and 307 agreed.
+  const tsv = (...l) => l.map(x => x.split('\t'))
+  const N = 40
+  const txRows = ['featureID\tgroupID\tlog2FoldChange\tpvalue\tpadj']
+  const cnt = ['transcript_id,a,b,c,d']
+  const smp = [
+    { sample: 'a', group: 'WT' }, { sample: 'b', group: 'WT' },
+    { sample: 'c', group: 'KO' }, { sample: 'd', group: 'KO' }]
+  for (let i = 0; i < N; i++) {
+    // Isoform 1 dominates in WT, isoform 2 in KO — so in KO-vs-WT terms
+    // isoform 1 goes DOWN. The table is written the other way round (+3).
+    txRows.push(`T${i}a\tG${i}\t3\t1e-9\t1e-8`)
+    txRows.push(`T${i}b\tG${i}\t-3\t1e-9\t1e-8`)
+    cnt.push(`T${i}a,90,92,3,4`)
+    cnt.push(`T${i}b,3,4,90,92`)
+  }
+  const r = dtuFromPipeline({ transcript: tsv(...txRows) }, cnt.join('\n') + '\n',
+    smp, 'KO', 'WT')
+  check('an inverted table is detected', r.flipped, true)
+  check('and the run says so', /OPPOSITE direction/.test(r.notes.join(' ')), true)
+  const first = r.dtuCsv.trim().split('\n')[1].split(',').map(x => x.replace(/"/g, ''))
+  // T0a: dominant in WT, so under KO-vs-WT its effect must be NEGATIVE.
+  check('the effect is negated to match the comparison', first[2], '-3')
+  check('the p-value is untouched', first[3], '1e-9')
+  check('and so is the FDR', first[4], '1e-8')
+
+  // The same table attached the right way round must NOT be touched.
+  const ok = dtuFromPipeline({ transcript: tsv(...txRows) }, cnt.join('\n') + '\n',
+    smp, 'WT', 'KO')
+  check('a correctly-oriented table is left alone', ok.flipped, false)
+  check('its effect is as supplied',
+    ok.dtuCsv.trim().split('\n')[1].split(',')[2].replace(/"/g, ''), '3')
+}
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll isoform-layer tests passed\n')
 process.exit(failed ? 1 : 0)
