@@ -255,5 +255,28 @@ export function dtuFromPipeline(
       ? `per-gene q-values: ${geneQ.size.toLocaleString()} from DEXSeq's perGeneQValue`
       : 'no results_dtu_gene.tsv supplied, so the bundle carries no per-gene q-value',
   ]
+
+  /**
+   * The shares are computed from the UPLOADED matrix; DEXSeq ran on the
+   * pipeline's. If those two disagree about which isoforms a gene has, the
+   * statistics stay right and the shares silently do not — a gene truncated to
+   * one isoform reads as 100% in both groups beside a significant p-value,
+   * which looks like a result and is an artifact of the upload.
+   */
+  const missing = [...geneOf.keys()].filter(t => !counts.has(t)).length
+  if (missing) {
+    notes.push(
+      `${missing.toLocaleString()} of ${nTested.toLocaleString()} transcripts in the DEXSeq ` +
+      `table are not in the counts matrix, so they carry no usage share. The statistics are ` +
+      `unaffected; the shares are drawn from the matrix you uploaded.`)
+  }
+  const singleton = [...geneTotal.keys()].filter(g =>
+    [...geneOf.values()].filter(x => x === g).length === 1).length
+  if (singleton) {
+    notes.push(
+      `${singleton.toLocaleString()} gene(s) have a single isoform in the uploaded matrix, so ` +
+      `their shares are 100% in both groups. If DEXSeq tested them, it saw more isoforms than ` +
+      `this matrix has — check that the counts and the DEXSeq table come from the same run.`)
+  }
   return { dtuCsv: out.join('\n') + '\n', nTested, nDtu, nGeneQ: geneQ.size, notes }
 }

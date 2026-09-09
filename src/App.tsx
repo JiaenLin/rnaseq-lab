@@ -841,8 +841,8 @@ export default function App() {
                     <span>Also run the isoform layer</span>
                   </label>
                   <p className="mt-1 pl-6 text-slate-600 dark:text-slate-300">
-                    {describeLongRead(longRead)}. Adds transcript-level DESeq2 and a{' '}
-                    transcript-level <b>DESeq2</b> per comparison, keeping {FILTER_NOTE}.
+                    {describeLongRead(longRead)}. Adds transcript-level <b>DESeq2</b> per
+                    comparison, keeping {FILTER_NOTE}.
                   </p>
                   <div className="mt-2 pl-6">
                     <button className="btn btn-ghost text-xs" onClick={() => sqantiRef.current?.click()}>
