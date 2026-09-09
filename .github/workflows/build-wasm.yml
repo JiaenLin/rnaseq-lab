@@ -27,10 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build locfit for WebAssembly
+      - name: Build the WASM binaries with no public build
         uses: r-wasm/actions/build-rwasm@v3
         with:
-          packages: "local::./wasm-src/locfit, bioc::apeglm"
+          packages: "local::./wasm-src/locfit, bioc::apeglm, bioc::Rsamtools, cran::XML"
           repo-path: "wasm-repo"
           strip: "demo, doc, examples, help, html, include, tests, vignette"
           webr-image: "ghcr.io/r-wasm/webr:main"
@@ -40,7 +40,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           rm -rf wasm-repo/.gitignore
           git add wasm-repo
-          if git commit -m "Build locfit + apeglm WASM binaries"; then
+          if git commit -m "Build locfit, apeglm, Rsamtools and XML WASM binaries"; then
             git push
           else
             echo "no changes to commit"
