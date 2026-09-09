@@ -255,7 +255,18 @@ export function buildBundleFiles(
        */
       dte_fit: 'per-contrast, on that contrast\'s samples only',
       /** DTU engine, named because a satuRn bundle would not be comparable. */
-      dtu_engine: 'DEXSeq',
+      /**
+       * Named because a different engine's numbers are not comparable, and this
+       * one is deliberately NOT the engine the ONT pipeline runs: DEXSeq imports
+       * Rsamtools, which has no WebAssembly build, so it cannot load in a browser.
+       */
+      dtu_engine: 'satuRn',
+      /**
+       * What `usage_effect` in dtu_*.csv is measured in. satuRn fits a
+       * quasi-binomial model of each isoform's share, so its effect is a change
+       * in LOG ODDS of usage — not a log2 fold change and not comparable to one.
+       */
+      dtu_effect_scale: 'log-odds of isoform usage (quasi-binomial)',
       dtu_filter: 'total counts >= 10 and >= 3 counts in >= 2 samples',
     } : null,
     contrasts: ordered.map(c => ({

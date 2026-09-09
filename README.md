@@ -70,14 +70,24 @@ Three things then run instead of one:
 |---|---|
 | gene-level DESeq2 | unchanged — the same fit, the same numbers, the same `deg_*.csv` |
 | transcript-level DESeq2 | **DTE** — is this isoform present at a different level? |
-| DEXSeq | **DTU** — did the gene's isoform *mix* change? |
+| satuRn | **DTU** — did the gene's isoform *mix* change? |
 
 DTU is the one that needs long reads. A gene can be perfectly flat while its dominant
-isoform swaps, and no gene-level table can show that. DEXSeq is used because it is what
-wf-transcriptomes itself runs, so a bundle built here is comparable to the cluster's own
-`results_dtu_transcript.tsv` rather than merely similar to it. It is the slow half of the
-run and tests one comparison at a time, keeping transcripts with at least 10 counts in
-total and at least 3 counts in at least 2 samples.
+isoform swaps, and no gene-level table can show that.
+
+**Why satuRn and not DEXSeq.** DEXSeq is what wf-transcriptomes itself runs, so it was the
+first choice — a bundle built with it would have been directly comparable to the cluster's
+own `results_dtu_transcript.tsv`. It cannot run in a browser: DEXSeq imports `Rsamtools`,
+which wraps htslib, and **no WebAssembly build of Rsamtools exists** on either
+`repo.r-wasm.org` or `bioc.r-universe.dev`, so `library(DEXSeq)` fails at namespace load.
+Of the alternatives DRIMSeq needs only `locfit` (which this app already builds) and satuRn
+needs nothing at all; satuRn is built for exactly this scale and asks the same question.
+
+The cost is recorded in the bundle rather than glossed: satuRn's effect is a change in the
+**log odds** of an isoform's usage, not a log2 fold change, and its numbers are not
+arithmetically comparable to DEXSeq's. `meta.json` names both the engine and the scale.
+The filter is unchanged — at least 10 counts in total and at least 3 counts in at least 2
+samples.
 
 **Names, not accessions.** `Nppb-201` for an annotated model; `Nppb-novel-1` for a novel
 isoform of a known gene, numbered by position within the gene so it is stable across

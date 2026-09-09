@@ -10,10 +10,26 @@
 // transcript rows, same engine, same filter, same shrinkage.
 //
 // DTU answers the question long reads exist for: "did the MIX change?" A gene
-// can be flat while its isoforms swap. That is DEXSeq, which is the engine
-// Oxford Nanopore's own wf-transcriptomes runs, so a bundle built here is
-// comparable to the cluster's `results_dtu_transcript.tsv` rather than merely
-// similar to it.
+// can be flat while its isoforms swap.
+//
+// WHY satuRn AND NOT DEXSeq. DEXSeq is what Oxford Nanopore's own
+// wf-transcriptomes runs, so it was the first choice and a bundle built with it
+// would have been directly comparable to the cluster's own
+// `results_dtu_transcript.tsv`. It cannot run here: DEXSeq `Imports: Rsamtools`,
+// Rsamtools wraps htslib, and **no WebAssembly build of it exists** — not on
+// repo.r-wasm.org, not on bioc.r-universe.dev. `library(DEXSeq)` fails at
+// namespace load with "there is no package called 'Rsamtools'", which is what a
+// live run on the deployed app reported after the gene-level fit had already
+// finished.
+//
+// Of the two alternatives, DRIMSeq needs only locfit (which this app already
+// builds and hosts) and satuRn needs nothing at all. satuRn is chosen: it is
+// built for exactly this scale, and its quasi-binomial model of each isoform's
+// share is the same question DEXSeq asks.
+//
+// The cost is stated rather than hidden: **satuRn's numbers are not DEXSeq's**,
+// so a bundle built here is no longer arithmetically comparable to the
+// cluster's table. meta.json names the engine for this reason.
 
 import type { Shrink } from './webr.ts'
 
@@ -32,7 +48,7 @@ export interface DtuInput {
 export interface DtuResult {
   /** DESeq2 on transcript rows: transcript_id,baseMean,log2FoldChange,lfcSE,pvalue,padj */
   dteCsv: string
-  /** DEXSeq: transcript_id,gene_id,usage_log2FC,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den */
+  /** transcript_id,gene_id,usage_effect,pvalue,padj,gene_padj,mean_usage_num,mean_usage_den */
   dtuCsv: string
   nTested: number
   nDte: number
@@ -53,7 +69,7 @@ export const FILTER_NOTE =
   'at least 10 counts in total and at least 3 counts in at least 2 samples'
 
 const R = String.raw`webr::eval_js('0')
-suppressMessages({ library(DESeq2); library(DEXSeq) })
+suppressMessages({ library(DESeq2); library(satuRn); library(SummarizedExperiment) })
 
 cnt <- read.csv("/work/tx_counts.csv", row.names = 1, check.names = FALSE)
 cd  <- read.csv("/work/tx_coldata.csv", stringsAsFactors = FALSE)
@@ -94,40 +110,70 @@ dte <- data.frame(transcript_id = rownames(res), baseMean = res$baseMean,
                   pvalue = res$pvalue, padj = res$padj)
 write.csv(dte, "/work/dte.csv", row.names = FALSE, na = "NA")
 
-# ---- DTU: DEXSeq, transcripts as the "exons" of their gene ---------------
-# A gene with ONE surviving transcript carries no usage information at all —
-# its single isoform is 100% of the gene in every sample by construction — and
-# DEXSeq cannot fit it. Dropping them here is what keeps the run from failing
-# on a third of the matrix.
+# ---- DTU: satuRn, a quasi-binomial model of each isoform's SHARE ---------
+# A gene with ONE surviving transcript carries no usage information at all --
+# its single isoform is 100% of the gene in every sample by construction -- and
+# no usage model can fit it. Dropping them here is what keeps the run from
+# failing on a third of the matrix.
 multi <- gene %in% names(which(table(gene) > 1))
 notes <- c(notes, sprintf("DTU: %d transcripts in %d multi-isoform genes",
                           sum(multi), length(unique(gene[multi]))))
 dtu <- data.frame(transcript_id = character(0), gene_id = character(0),
-                  usage_log2FC = numeric(0), pvalue = numeric(0), padj = numeric(0),
+                  usage_effect = numeric(0), pvalue = numeric(0), padj = numeric(0),
                   gene_padj = numeric(0), mean_usage_num = numeric(0),
                   mean_usage_den = numeric(0))
 if (sum(multi) > 1) {
   cm <- cnt[multi, , drop = FALSE]
   gm <- gene[multi]
-  sd0 <- data.frame(condition = grp, row.names = colnames(cm))
-  dxd <- DEXSeqDataSet(countData = cm, sampleData = sd0,
-                       design = ~ sample + exon + condition:exon,
-                       featureID = rownames(cm), groupID = gm)
-  dxd <- estimateSizeFactors(dxd)
-  dxd <- estimateDispersions(dxd, quiet = TRUE)
-  dxd <- testForDEU(dxd)
-  dxd <- estimateExonFoldChanges(dxd, fitExpToVar = "condition")
-  dr  <- DEXSeqResults(dxd)
+
+  tx  <- data.frame(isoform_id = rownames(cm), gene_id = gm, row.names = rownames(cm))
+  cd2 <- data.frame(group = grp, row.names = colnames(cm))
+  se  <- SummarizedExperiment(assays = list(counts = cm), colData = cd2, rowData = tx)
+  se  <- satuRn::fitDTU(object = se, formula = ~ 0 + group, parallel = FALSE, verbose = FALSE)
+
+  design <- model.matrix(~ 0 + group, data = cd2)
+  colnames(design) <- levels(grp)
+  L <- matrix(0, nrow = ncol(design), ncol = 1,
+              dimnames = list(colnames(design), "contrast"))
+  L["__DEN__", 1] <- -1
+  L["__NUM__", 1] <- 1
+  se <- satuRn::testDTU(object = se, contrasts = L,
+                        diagplot1 = FALSE, diagplot2 = FALSE, sort = FALSE)
+  sr <- rowData(se)[["fitDTUResult_contrast"]]
+
+  # satuRn reports a regular FDR and an EMPIRICAL one, and recommends the
+  # empirical for FDR control. On a small design the empirical null can fail to
+  # fit and come back all-NA, so it is used when it exists and the fallback is
+  # recorded rather than silently taken.
+  padj <- sr$empirical_FDR
+  pval <- sr$empirical_pval
+  which_p <- "satuRn empirical"
+  if (all(is.na(padj))) {
+    padj <- sr$regular_FDR; pval <- sr$pval
+    which_p <- "satuRn regular (the empirical null did not fit)"
+  }
+  notes <- c(notes, paste("DTU p-values:", which_p))
+
+  # A per-gene q-value, built rather than borrowed: Simes across a gene's own
+  # transcript p-values, then BH across genes. The minimum transcript padj is
+  # NOT a gene-level q and must not be labelled as one.
+  gid <- as.character(rowData(se)$gene_id)
+  simes <- tapply(pval, gid, function(p) {
+    p <- sort(p[!is.na(p)])
+    if (!length(p)) return(NA_real_)
+    min(length(p) * p / seq_along(p), 1)
+  })
+  gq <- p.adjust(simes, method = "BH")
 
   # Observed usage per group: each transcript's share of its gene's total.
   # Written out rather than left to the reader, because a proportion the app
   # recomputed could disagree with the test that was actually run.
+  #
   # NAMES MATTER HERE AND ARE NOT AUTOMATIC. ifelse copies the attributes of its
   # TEST argument, so ifelse(tot > 0, ...) returns a matrix carrying tot's
   # rownames -- which are GENE ids, duplicated, because tot was built by rowsum.
-  # rowMeans then inherits those, and the lookups below index a gene-named
-  # vector by transcript id: every mean_usage_ value came back NA, on every row,
-  # with no error anywhere. setNames is the whole fix.
+  # rowMeans then inherits those, and a transcript-id lookup into a gene-named
+  # vector is NA on every row, with no error anywhere.
   gtot <- rowsum(cm, gm)
   share <- function(which) {
     s <- cm[, which, drop = FALSE]
@@ -136,17 +182,19 @@ if (sum(multi) > 1) {
                     rownames(cm))
   }
   un <- share(grp == "__NUM__"); ud <- share(grp == "__DEN__")
-  lfc <- as.numeric(dr[[grep("^log2fold", colnames(dr))[1]]])
-  gp  <- suppressWarnings(perGeneQValue(dr))
+  ids <- as.character(rowData(se)$isoform_id)
   dtu <- data.frame(
-    transcript_id = as.character(dr$featureID),
-    gene_id       = as.character(dr$groupID),
-    usage_log2FC  = lfc,
-    pvalue        = as.numeric(dr$pvalue),
-    padj          = as.numeric(dr$padj),
-    gene_padj     = as.numeric(gp[as.character(dr$groupID)]),
-    mean_usage_num = as.numeric(un[as.character(dr$featureID)]),
-    mean_usage_den = as.numeric(ud[as.character(dr$featureID)]))
+    transcript_id  = ids,
+    gene_id        = gid,
+    # satuRn's effect is on the quasi-binomial LOGIT scale -- a change in log
+    # odds of usage, not a log2 fold change. Named for what it is; meta.json
+    # records the scale so nothing downstream reads it as a fold change.
+    usage_effect   = as.numeric(sr$estimates),
+    pvalue         = as.numeric(pval),
+    padj           = as.numeric(padj),
+    gene_padj      = as.numeric(gq[gid]),
+    mean_usage_num = as.numeric(un[ids]),
+    mean_usage_den = as.numeric(ud[ids]))
 }
 write.csv(dtu, "/work/dtu.csv", row.names = FALSE, na = "NA")
 
@@ -170,8 +218,7 @@ export async function runDtu(
   await webR.FS.writeFile('/work/tx2gene.csv', enc.encode('transcript_id,gene_id\n' +
     [...input.txToGene].map(([t, g]) => `${csvEsc(t)},${csvEsc(g)}`).join('\n') + '\n'))
 
-  onLog('Running DESeq2 on transcripts, then DEXSeq for usage — '
-    + 'DEXSeq is the slow half and cannot be parallelised here.')
+  onLog('Running DESeq2 on transcripts, then satuRn for usage.')
 
   const summary: string = await webR.evalRString(
     R.replaceAll('__NUM__', input.numerator)

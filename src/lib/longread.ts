@@ -249,7 +249,7 @@ function sumToGenes(
     // engines model integers. Rounding per transcript and then summing, and
     // rounding the gene sum, give different gene totals; doing it once at the
     // transcript level means the gene matrix, the transcript matrix shipped in
-    // the bundle, and the matrix DEXSeq is handed are all sums of the SAME
+    // the bundle, and the matrix the usage test is handed are all sums of the SAME
     // integers, and a reader can reproduce one from the other.
     const rounded = new Array<number>(nSamples)
     for (let sIdx = 0; sIdx < nSamples; sIdx++) {

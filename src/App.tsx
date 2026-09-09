@@ -74,7 +74,7 @@ export default function App() {
   const [uploadErr, setUploadErr] = useState<string | null>(null)
   const [uploadBusy, setUploadBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
-  /** Transcript counts exactly as uploaded. DEXSeq models these, not the gene sums. */
+  /** Transcript counts exactly as uploaded. The usage test models these, not the gene sums. */
   const txCountsRef = useRef<string | null>(null)
 
   // design
@@ -541,7 +541,7 @@ export default function App() {
               <li>· <code className="font-mono text-[12px]">*.SummarizedExperiment.rds</code></li>
               <li>· <code className="font-mono text-[12px]">cohort/transcript_counts.tsv</code> — Oxford
                 Nanopore <b>wf-transcriptomes</b>. Quantified per isoform, so the lab sums it to genes
-                <em>and</em> keeps the transcript layer: it adds isoform-level DESeq2 and a DEXSeq usage
+                <em>and</em> keeps the transcript layer: it adds isoform-level DESeq2 and a satuRn usage
                 test to the bundle. A PacBio or StringTie transcript matrix works the same way.</li>
             </ul>
             <button className="btn btn-primary" disabled={uploadBusy} onClick={() => fileRef.current?.click()}>
@@ -789,8 +789,9 @@ export default function App() {
                   </label>
                   <p className="mt-1 pl-6 text-slate-600 dark:text-slate-300">
                     {describeLongRead(longRead)}. Adds transcript-level DESeq2 and a{' '}
-                    <b>DEXSeq</b> usage test per comparison, keeping {FILTER_NOTE}. DEXSeq is the
-                    slow half and runs one comparison at a time.
+                    <b>satuRn</b> usage test per comparison, keeping {FILTER_NOTE}. It runs
+                    one comparison at a time. (Not DEXSeq: that imports Rsamtools, which has
+                    no WebAssembly build, so it cannot load in a browser.)
                   </p>
                   <div className="mt-2 pl-6">
                     <button className="btn btn-ghost text-xs" onClick={() => sqantiRef.current?.click()}>
