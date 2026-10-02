@@ -105,7 +105,15 @@ const csvCell = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` 
  */
 export function parseMatrix(rows: string[][]): ParsedMatrix {
   if (!rows.length) throw new Error('The file is empty.')
-  const header = rows[0].map(h => String(h ?? '').trim())
+  // A byte-order mark sits on the first cell of the first row and nowhere else.
+  // Callers here happen to `trim()` the text first, which removes it — U+FEFF is
+  // whitespace to trim() — but that is the caller's habit, not this function's
+  // contract, and a header of "\uFEFFgene_id" matches no pattern in
+  // ANNOTATION_RX. One line so the rule does not depend on who calls it.
+  const header = rows[0].map((h, i) => {
+    const t = String(h ?? '')
+    return (i === 0 && t.charCodeAt(0) === 0xFEFF ? t.slice(1) : t).trim()
+  })
   const body = rows.slice(1).filter(r => r.some(c => String(c ?? '').trim() !== ''))
   if (!body.length) throw new Error('The file has a header but no data rows.')
 

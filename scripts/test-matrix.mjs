@@ -179,6 +179,22 @@ throws('so is a quote',
 check('a clean matrix still parses',
   parseMatrix([['gene_id', 'a', 'b'], ['G1', '1', '2'], ['G2', '3', '4']]).samples, ['a', 'b'])
 
+{
+  // A byte-order mark lands on the first header cell. Callers trim (U+FEFF is
+  // whitespace to trim) but that is their habit, not this function's contract —
+  // and "\uFEFFgene_id" matches nothing in ANNOTATION_RX, so the key column
+  // would be classified by its values alone.
+  const m = parseMatrix([
+    ['\uFEFFgene_id', 'gene_name', 'WT_1', 'KO_1'],
+    ['G1', 'Gx', '10', '20'],
+    ['G2', 'Gy', '5', '7'],
+  ])
+  check('the mark is gone from the key column', m.annotationColumns[0], 'gene_id')
+  check('and it is still recognised as annotation', m.samples, ['WT_1', 'KO_1'])
+  check('the emitted csv header is clean',
+    m.countsCsv.split('\n')[0], 'gene_id,WT_1,KO_1')
+}
+
 console.log('\nPROBE')
 const big = [['gene_id', 'a', 'b', 'c']]
 for (let i = 0; i < 5000; i++) big.push([`G${i}`, String(i), String(i + 1), String(i + 2)])
