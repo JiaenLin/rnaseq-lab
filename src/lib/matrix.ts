@@ -65,7 +65,7 @@ const PROBE_ROWS = 2000
  * already had, one file format later.
  */
 const ANNOTATION_RX =
-  /^(gene[_.]?id|gene[_.]?name|gene[_.]?symbol|symbol|name|transcript[_.]?id|tx[_.]?id|id|entrez([_.]?(gene|id))?|ensembl([_.]?id)?|refseq|description|biotype|gene[_.]?biotype|chr|chromosome|start|end|strand|length|gene[_.]?length|width|locus|txname|tx[_.]?name|transcript[_.]?name|ndr|novel[_.]?gene|novel[_.]?transcript|tx[_.]?class[_.]?description|read[_.]?count|rel[_.]?read[_.]?count|rel[_.]?subset[_.]?count|eq[_.]?class[_.]?by[_.]?id|structural[_.]?category|associated[_.]?gene|associated[_.]?transcript|n[_.]?exons|exons|coding|orf[_.]?length|cds[_.]?(start|end|length)|predicted[_.]?nmd|display[_.]?name)$/i
+  /^(gene[_.]?id|gene[_.]?name|gene[_.]?symbol|symbol|name|transcript[_.]?id|tx[_.]?id|id|entrez([_.]?(gene|id))?|ensembl([_.]?id)?|refseq|description|biotype|gene[_.]?biotype|chr|chromosome|start|end|strand|length|gene[_.]?length|width|locus|txname|tx[_.]?name|transcript[_.]?name|ndr|novel[_.]?gene|novel[_.]?transcript|tx[_.]?class[_.]?description|read[_.]?count|rel[_.]?read[_.]?count|rel[_.]?subset[_.]?count|eq[_.]?class[_.]?by[_.]?id|structural[_.]?category|associated[_.]?gene|associated[_.]?transcript|n[_.]?exons|exons|coding|orf[_.]?length|cds[_.]?(start|end|length)|predicted[_.]?nmd|display[_.]?name|gene[_.]?(start|end|chr|chrom|chromosome|strand|biotype|type|source|version|description|desc|status|band|synonym|entrez|symbol)|tf[_.]?family|transcript[_.]?(start|end|chr|strand|biotype|type)|tsl|seqnames?)$/i
 
 /** A gene symbol column is the one we want to keep as `gene_name`. */
 const SYMBOL_RX = /^(gene[_.]?name|gene[_.]?symbol|symbol|name)$/i

@@ -9,6 +9,9 @@ import {
 } from './lib/bundle'
 import { parseMatrix, probeFromCsv, type Probe } from './lib/matrix'
 import {
+  groupsByRule, isValidPattern, NAMING_RULES, type NamingRule,
+} from './lib/groups'
+import {
   isTranscriptMatrix, readLongRead, applySqanti, describe as describeLongRead,
   type LongReadInput,
 } from './lib/longread'
@@ -82,6 +85,9 @@ export default function App() {
   const [factorNames, setFactorNames] = useState<string[]>([])
   const [refs, setRefs] = useState<string[]>([])
   const [groupOf, setGroupOf] = useState<Record<string, string>>({})
+  /** How sample names are read into group names. 'auto' is the inference. */
+  const [naming, setNaming] = useState<NamingRule>('auto')
+  const [pattern, setPattern] = useState('')
   /**
    * Which comparisons to export — `null` until somebody says.
    *
@@ -299,6 +305,34 @@ export default function App() {
     } catch (e: any) {
       setDexseqNote(String(e?.message || e))
     }
+  }
+
+  /**
+   * Re-read every sample name under the chosen rule.
+   *
+   * Only the GROUPING is recomputed — per-sample overrides the reader has
+   * already made are dropped on purpose, because they were made against a
+   * different reading of the names and silently keeping them would mix two
+   * answers to the same question.
+   */
+  function applyNaming(rule: NamingRule, pat: string) {
+    setNaming(rule); setPattern(pat)
+    if (!counts) return
+    const groups = rule === 'auto' ? null : groupsByRule(counts.samples, rule, pat)
+    const d = groups
+      ? (() => {
+          const levels = [...new Set(groups)]
+          return {
+            factors: [{ name: 'group', levels, values: groups }],
+            groups, groupLevels: levels, factorial: false, balanced: false,
+          } as Design
+        })()
+      : detectFactors(counts.samples)
+    setDesign(d)
+    setFactorNames(d.factors.map(f => f.name))
+    setRefs(d.factors.map(f => f.levels[0]))
+    setGroupOf(Object.fromEntries(counts.samples.map((x, i) => [x, d.groups[i]])))
+    setChosen(null)
   }
 
   /* ---------- derived design ---------- */
@@ -624,6 +658,28 @@ export default function App() {
                 {counts.colDataColumns.length > 0 && ' The sample table came with the object.'}
               </p>
 
+            <div className="mb-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700">
+              <label className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="text-slate-600 dark:text-slate-300">Read sample names as</span>
+                <select className="input py-1 text-sm" value={naming}
+                  onChange={e => applyNaming(e.target.value as NamingRule, pattern)}>
+                  {NAMING_RULES.map(r => <option key={r.id} value={r.id}>{r.label}</option>)}
+                </select>
+                {naming === 'regex' && (
+                  <input className={`input py-1 font-mono text-sm ${isValidPattern(pattern) ? '' : 'border-red-400'}`}
+                    placeholder="[-_]+\d+$" value={pattern} spellCheck={false}
+                    onChange={e => applyNaming('regex', e.target.value)} />
+                )}
+              </label>
+              <p className="mt-1 text-xs text-slate-500">
+                {naming === 'regex' && !isValidPattern(pattern)
+                  ? <span className="text-red-500">That is not a valid pattern yet.</span>
+                  : <>{NAMING_RULES.find(r => r.id === naming)?.hint}
+                    {' — '}{groupLevels.length} group{groupLevels.length === 1 ? '' : 's'}:{' '}
+                    {groupLevels.slice(0, 6).join(', ')}{groupLevels.length > 6 ? ` +${groupLevels.length - 6}` : ''}</>}
+              </p>
+            </div>
+
               {named.factors.length > 1 ? (
                 <div className="mb-4 rounded-lg border border-indigo-200 bg-indigo-50/60 p-3 dark:border-indigo-500/30 dark:bg-indigo-500/10">
                   <p className="mb-2 text-xs text-slate-600 dark:text-slate-300">
@@ -787,6 +843,7 @@ export default function App() {
                 </p>
               )}
 
+
               <details className="mb-3">
                 <summary className="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-300">
                   Sample assignment ({activeSamples.length} in · {counts.samples.length - activeSamples.length} excluded)
@@ -797,18 +854,33 @@ export default function App() {
                       {counts.samples.map(s => (
                         <tr key={s} className="border-t border-slate-100 first:border-0 dark:border-slate-800">
                           <td className="px-3 py-1.5 font-mono text-[13px]">{s}</td>
-                          <td className="px-3 py-1.5 text-right">
-                            <select className="input py-0.5 text-xs" value={groupOf[s] ?? EXCLUDED}
-                              onChange={e => { setGroupOf(p => ({ ...p, [s]: e.target.value })); setChosen(null) }}>
-                              {[...new Set([...named.groupLevels, EXCLUDED])].map(g => (
-                                <option key={g} value={g}>{g === EXCLUDED ? 'exclude' : g}</option>
-                              ))}
-                            </select>
+                          <td className="flex items-center justify-end gap-1 px-3 py-1.5">
+                            {/* A text input, not a select. A closed list can only
+                                offer the groups detection already found, so when
+                                detection is wrong — which is exactly when someone
+                                opens this panel — there is nothing useful to pick.
+                                Typing a new name creates the group. */}
+                            <input className="input w-40 py-0.5 text-xs" list="rl-groups"
+                              value={groupOf[s] === EXCLUDED ? '' : (groupOf[s] ?? '')}
+                              placeholder="excluded" spellCheck={false}
+                              onChange={e => {
+                                const v = e.target.value.trim()
+                                setGroupOf(p => ({ ...p, [s]: v || EXCLUDED })); setChosen(null)
+                              }} />
+                            <button className="btn btn-ghost px-1.5 py-0.5 text-xs"
+                              title={groupOf[s] === EXCLUDED ? 'include' : 'exclude'}
+                              onClick={() => {
+                                setGroupOf(p => ({ ...p, [s]: p[s] === EXCLUDED ? (named.groupLevels[0] ?? 'group1') : EXCLUDED }))
+                                setChosen(null)
+                              }}>{groupOf[s] === EXCLUDED ? '+' : '×'}</button>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
+                  <datalist id="rl-groups">
+                    {named.groupLevels.map(g => <option key={g} value={g} />)}
+                  </datalist>
                 </div>
               </details>
 
